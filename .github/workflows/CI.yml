@@ -137,6 +137,11 @@ jobs:
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
     - uses: taiki-e/install-action@cfb6a08e73d810c62150cc379cc3670921bec901 # protoc
 
+    - name: Verify source ref is current
+      run: |
+        git fetch --force --no-tags origin "$GITHUB_REF"
+        test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$(git rev-parse 'HEAD^{commit}')"
+
     - name: Build release binaries
       run: cargo build --locked --release -p kuberic-operator -p kuberic-operator2 -p kvstore
 
@@ -159,8 +164,6 @@ jobs:
         tags: |
           type=ref,event=branch
           type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=semver,pattern={{major}}
           type=sha
           type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
@@ -184,8 +187,6 @@ jobs:
         tags: |
           type=ref,event=branch
           type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=semver,pattern={{major}}
           type=sha
           type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
@@ -209,8 +210,6 @@ jobs:
         tags: |
           type=ref,event=branch
           type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=semver,pattern={{major}}
           type=sha
           type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
