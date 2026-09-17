@@ -68,6 +68,7 @@ The operator watches `KubericSet` resources and manages the full lifecycle: pod 
 - [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
 - [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
+- [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
