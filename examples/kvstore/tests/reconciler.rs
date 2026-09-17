@@ -45,6 +45,10 @@ use kuberic_operator::crd::{
 };
 use kuberic_operator::durable::{RemoveReplicaTarget, start_remove_replica};
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
+use kuberic_operator::service_config::{
+    MANAGED_SERVICE_LABEL, MANAGED_SERVICE_VALUE, ManagedServicesStatus,
+};
+use kuberic_operator::services::ManagedServiceApi;
 
 use kvstore::proto;
 use kvstore::service;
@@ -433,6 +437,7 @@ struct KvClusterApi {
     statuses: Mutex<Vec<KubericSetStatus>>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
+    service_revision: Mutex<u64>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     fail_next_status_patch: Mutex<bool>,
     fail_after_next_status_patch: Mutex<bool>,
@@ -457,6 +462,7 @@ impl KvClusterApi {
             statuses: Mutex::new(Vec::new()),
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
+            service_revision: Mutex::new(0),
             operations: Arc::new(Mutex::new(Vec::new())),
             fail_next_status_patch: Mutex::new(false),
             fail_after_next_status_patch: Mutex::new(false),
@@ -951,7 +957,13 @@ impl ClusterApi for KvClusterApi {
         if std::mem::take(&mut *self.fail_next_status_patch.lock().unwrap()) {
             return Err("injected status persistence failure".to_string());
         }
-        self.statuses.lock().unwrap().push(status.clone());
+        let mut statuses = self.statuses.lock().unwrap();
+        let mut next = status.clone();
+        next.managed_services = statuses
+            .last()
+            .and_then(|status| status.managed_services.clone());
+        statuses.push(next);
+        drop(statuses);
         if std::mem::take(&mut *self.fail_after_next_status_patch.lock().unwrap()) {
             return Err("injected status response loss after apply".to_string());
         }
@@ -1054,6 +1066,106 @@ impl ClusterApi for KvClusterApi {
     }
 }
 
+#[async_trait]
+impl ManagedServiceApi for KvClusterApi {
+    async fn find_service(&self, _ns: &str, name: &str) -> Result<Option<Service>, String> {
+        Ok(self.services.lock().unwrap().get(name).cloned())
+    }
+
+    async fn list_additional_services(&self, _ns: &str) -> Result<Vec<Service>, String> {
+        Ok(self
+            .services
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|service| {
+                service
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(MANAGED_SERVICE_LABEL))
+                    .is_some_and(|value| value == MANAGED_SERVICE_VALUE)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn create_additional_service(
+        &self,
+        _ns: &str,
+        service: &Service,
+    ) -> Result<Service, String> {
+        let name = service.metadata.name.as_ref().unwrap();
+        let mut services = self.services.lock().unwrap();
+        if services.contains_key(name) {
+            return Err("Service already exists".to_string());
+        }
+        let mut revision = self.service_revision.lock().unwrap();
+        *revision += 1;
+        let mut service = service.clone();
+        service.metadata.uid = Some(format!("service-{revision}"));
+        service.metadata.resource_version = Some(revision.to_string());
+        let spec = service.spec.as_mut().unwrap();
+        spec.cluster_ip = Some(format!("10.0.0.{revision}"));
+        spec.cluster_ips = Some(vec![spec.cluster_ip.clone().unwrap()]);
+        services.insert(name.clone(), service.clone());
+        Ok(service)
+    }
+
+    async fn replace_additional_service(
+        &self,
+        _ns: &str,
+        service: &Service,
+    ) -> Result<Service, String> {
+        let name = service.metadata.name.as_ref().unwrap();
+        let mut services = self.services.lock().unwrap();
+        let current = services.get(name).ok_or("Service not found")?;
+        if current.metadata.uid != service.metadata.uid
+            || current.metadata.resource_version != service.metadata.resource_version
+        {
+            return Err("Service identity conflict".to_string());
+        }
+        let mut revision = self.service_revision.lock().unwrap();
+        *revision += 1;
+        let mut service = service.clone();
+        service.metadata.resource_version = Some(revision.to_string());
+        services.insert(name.clone(), service.clone());
+        Ok(service)
+    }
+
+    async fn delete_additional_service(&self, _ns: &str, service: &Service) -> Result<(), String> {
+        let name = service.metadata.name.as_ref().unwrap();
+        let mut services = self.services.lock().unwrap();
+        if let Some(current) = services.get(name) {
+            if current.metadata.uid != service.metadata.uid
+                || current.metadata.resource_version != service.metadata.resource_version
+            {
+                return Err("Service delete identity conflict".to_string());
+            }
+            services.remove(name);
+        }
+        Ok(())
+    }
+
+    async fn patch_managed_services_status(
+        &self,
+        set: &KubericSet,
+        status: Option<&ManagedServicesStatus>,
+    ) -> Result<(), String> {
+        let mut statuses = self.statuses.lock().unwrap();
+        let mut next = statuses
+            .last()
+            .cloned()
+            .or_else(|| set.status.clone())
+            .unwrap_or_default();
+        if next.managed_services.as_ref() != status {
+            next.managed_services = status.cloned();
+            statuses.push(next);
+        }
+        Ok(())
+    }
+}
+
 fn make_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -> KubericSet {
     make_set_with_min(name, replicas, 1, status)
 }
@@ -1082,6 +1194,7 @@ fn make_set_with_min(
             data_port: 9091,
             storage: "256Mi".to_string(),
             pvc_retention_policy: PvcRetentionPolicy::Delete,
+            managed: None,
         },
         status,
     }
@@ -2163,6 +2276,128 @@ async fn test_creation_status_retry_does_not_reopen_replicas() {
     )
     .await;
     assert_stable_snapshot(&api, &recovered_status, 1);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_managed_services_pending_does_not_block_creation_failover_or_restart() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let mut set = make_set("managed-failover", 3, None);
+    set.metadata.generation = Some(1);
+    set.spec.managed = Some(
+        serde_json::from_value(serde_json::json!({
+            "services": {"additional": [{
+                "selectorType": "rw",
+                "serviceTemplate": {
+                    "metadata": {"name": "managed-failover-external"},
+                    "spec": {"type": "LoadBalancer", "ports": [{"name": "app", "port": 8080}]}
+                }
+            }]}
+        }))
+        .unwrap(),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        set.status = api.last_status();
+        reconcile_set(&set, &api, &state).await.unwrap();
+        if api.last_status().unwrap().phase == Phase::Healthy {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "creation did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = api.last_status().unwrap();
+    assert_eq!(
+        status.managed_services.as_ref().unwrap().conditions[0].reason,
+        "AwaitingLoadBalancer"
+    );
+    let first_primary = status.current_primary.clone().unwrap();
+    let service_before = api.services.lock().unwrap()["managed-failover-external"].clone();
+    let mut kv = connect_kv(&api.client_address(&first_primary).unwrap()).await;
+    kv.put(proto::PutRequest {
+        key: "managed".to_string(),
+        value: "survived".to_string(),
+    })
+    .await
+    .unwrap();
+    api.crash_pod(&first_primary);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        set.status = api.last_status();
+        reconcile_set(&set, &api, &ReconcilerState::default())
+            .await
+            .unwrap();
+        let status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy && status.current_primary.as_ref() != Some(&first_primary)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "failover did not finish: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = api.last_status().unwrap();
+    assert_eq!(
+        status.managed_services.as_ref().unwrap().conditions[0].status,
+        "False"
+    );
+    assert_eq!(
+        api.services.lock().unwrap()["managed-failover-external"],
+        service_before
+    );
+    let mut kv = connect_kv(
+        &api.client_address(status.current_primary.as_ref().unwrap())
+            .unwrap(),
+    )
+    .await;
+    let value = retry_get(&mut kv, "managed").await.into_inner();
+    assert_eq!(value.value, "survived");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_managed_service_conflict_reports_failure_without_blocking_topology() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let foreign: Service = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "foreign-service", "uid": "not-ours"},
+        "spec": {"ports": [{"port": 8080}]}
+    }))
+    .unwrap();
+    api.services
+        .lock()
+        .unwrap()
+        .insert("foreign-service".to_string(), foreign.clone());
+    let mut set = make_set("managed-conflict", 1, None);
+    set.spec.managed = Some(
+        serde_json::from_value(serde_json::json!({
+            "services": {"additional": [{
+                "selectorType": "rw",
+                "serviceTemplate": {
+                    "metadata": {"name": "foreign-service"},
+                    "spec": {"type": "LoadBalancer", "ports": [{"name": "app", "port": 8080}]}
+                }
+            }]}
+        }))
+        .unwrap(),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Creating);
+    assert_eq!(
+        status.managed_services.unwrap().conditions[0].reason,
+        "ReconcileFailed"
+    );
+    assert_eq!(api.services.lock().unwrap()["foreign-service"], foreign);
+    assert_eq!(api.pods.lock().unwrap().len(), 1);
 }
 
 /// Full reconciler test: Pending → Creating → Healthy → write KV data.
