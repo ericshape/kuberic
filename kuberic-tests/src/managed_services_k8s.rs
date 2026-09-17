@@ -104,6 +104,29 @@ fn tcp_route_ready(route: &DynamicObject, gateway: &str) -> bool {
         })
 }
 
+fn tcp_route_targets_service(route: &DynamicObject, service: &str, port: i32) -> bool {
+    let Some(rules) = route.data.pointer("/spec/rules").and_then(Value::as_array) else {
+        return false;
+    };
+    let [rule] = rules.as_slice() else {
+        return false;
+    };
+    let Some(backends) = rule.get("backendRefs").and_then(Value::as_array) else {
+        return false;
+    };
+    let [backend] = backends.as_slice() else {
+        return false;
+    };
+    backend["name"] == service
+        && backend["port"] == port
+        && backend.get("group").is_none_or(|group| group == "")
+        && backend.get("kind").is_none_or(|kind| kind == "Service")
+        && backend
+            .get("namespace")
+            .is_none_or(|namespace| namespace == NAMESPACE)
+        && backend.get("weight").is_none_or(|weight| weight == 1)
+}
+
 async fn wait_gateway_resource(
     api: &Api<DynamicObject>,
     name: &str,
@@ -518,6 +541,59 @@ fn managed_tcp_route_rejects_stale_or_unresolved_conditions() {
 }
 
 #[test]
+fn managed_tcp_route_accepts_native_backend_defaults() {
+    let mut route = ready_tcp_route_fixture();
+    for port in [8080, 8082] {
+        for backend in [
+            json!({"name": "fixture-external", "port": port}),
+            json!({"group": "", "kind": "Service", "name": "fixture-external", "port": port, "weight": 1}),
+            json!({"group": "", "kind": "Service", "namespace": NAMESPACE, "name": "fixture-external", "port": port, "weight": 1}),
+        ] {
+            route.data["spec"] = json!({"rules": [{"backendRefs": [backend]}]});
+            assert!(tcp_route_targets_service(&route, "fixture-external", port));
+        }
+    }
+}
+
+#[test]
+fn managed_tcp_route_rejects_different_backend_semantics() {
+    let mut route = ready_tcp_route_fixture();
+    assert!(!tcp_route_targets_service(&route, "fixture-external", 8080));
+    let backend = json!({
+        "group": "", "kind": "Service", "name": "fixture-external", "port": 8080, "weight": 1
+    });
+    route.data["spec"] = json!({"rules": [{"backendRefs": [backend]}]});
+    for (field, value) in [
+        ("name", json!("another-service")),
+        ("port", json!(8082)),
+        ("port", Value::Null),
+        ("group", json!("another.group")),
+        ("kind", json!("Gateway")),
+        ("kind", Value::Null),
+        ("namespace", json!("another-namespace")),
+        ("weight", json!(0)),
+        ("weight", json!(2)),
+    ] {
+        let mut other = route.clone();
+        other.data["spec"]["rules"][0]["backendRefs"][0][field] = value;
+        assert!(
+            !tcp_route_targets_service(&other, "fixture-external", 8080),
+            "accepted wrong backend {field}"
+        );
+    }
+    let rule = route.data["spec"]["rules"][0].clone();
+    for rules in [
+        json!([]),
+        json!([rule, rule]),
+        json!([{"backendRefs": []}]),
+        json!([{"backendRefs": [backend, backend]}]),
+    ] {
+        route.data["spec"]["rules"] = rules;
+        assert!(!tcp_route_targets_service(&route, "fixture-external", 8080));
+    }
+}
+
+#[test]
 fn managed_gateway_resources_belong_only_to_the_fixture_parent() {
     let parent: DynamicObject = serde_json::from_value(json!({
         "apiVersion": "kuberic.io/v1", "kind": "KubericSet",
@@ -784,9 +860,10 @@ async fn managed_services_scenario() {
     let proxy_service = wait_proxy_service(client.clone(), &name).await;
     let forwarding = GatewayPortForward::start(&proxy_service).await;
     let endpoint = forwarding.endpoint.clone();
-    assert_eq!(
-        route_before.data["spec"]["rules"][0]["backendRefs"],
-        json!([{"name": external_name, "port": 8080}])
+    assert!(
+        tcp_route_targets_service(&route_before, &external_name, 8080),
+        "TCPRoute must target only the fixture Service: {:?}",
+        route_before.data["spec"]
     );
     connect_and_write(&endpoint, "before-failover").await;
 
@@ -953,8 +1030,7 @@ async fn managed_services_scenario() {
         "spec": {"rules": [{"backendRefs": [{"name": external_name, "port": 8082}]}]}
     }))).await.expect("update fixture route to the new Service port, not targetPort or NodePort");
     let route_updated = wait_gateway_resource(&routes, &name, |object| {
-        tcp_route_ready(object, &name)
-            && object.data["spec"]["rules"][0]["backendRefs"][0]["port"] == 8082
+        tcp_route_ready(object, &name) && tcp_route_targets_service(object, &external_name, 8082)
     })
     .await;
     assert_eq!(route_before.metadata.uid, route_updated.metadata.uid);
