@@ -19,6 +19,7 @@ env:
 
 jobs:
   build:
+    name: Build and test
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -96,8 +97,32 @@ jobs:
     - name: Install pinned Gateway API and Envoy Gateway
       run: just gateway-install
 
-    - name: Run workspace tests
-      run: cargo test --workspace --all-features -- --nocapture
+    - name: Test kuberic-core
+      run: cargo test -p kuberic-core --all-features -- --nocapture
+
+    - name: Test kuberic-dex
+      run: cargo test -p kuberic-dex --all-features -- --nocapture
+
+    - name: Test sqlite-commit-barrier
+      run: cargo test -p sqlite-commit-barrier --all-features -- --nocapture
+
+    - name: Test kuberic-operator
+      run: cargo test -p kuberic-operator --all-features -- --nocapture
+
+    - name: Test kuberic-operator2
+      run: cargo test -p kuberic-operator2 --all-features -- --nocapture
+
+    - name: Test KVStore example
+      run: cargo test -p kvstore --all-features -- --nocapture
+
+    - name: Test PostgreSQL example
+      run: cargo test -p postgres-replicated --all-features -- --nocapture
+
+    - name: Test SQLite example
+      run: cargo test -p sqlite-replicated --all-features -- --nocapture
+
+    - name: Test Kubernetes integration
+      run: cargo test -p kuberic-tests --all-features -- --nocapture
 
     - name: Collect Gateway diagnostics
       if: failure()
