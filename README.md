@@ -71,8 +71,8 @@ GitHub Container Registry:
 - `ghcr.io/ericshape/kuberic-operator2`
 - `ghcr.io/ericshape/kvstore`
 
-Main-branch images receive `main`, `latest`, and commit SHA tags. A semantic
-version tag such as `v0.1.0` also publishes version-specific tags.
+Main-branch images receive immutable commit SHA tags. A semantic version tag
+such as `v0.1.0` also publishes the exact version tag.
 
 ## Design
 

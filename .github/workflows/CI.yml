@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -162,10 +162,8 @@ jobs:
         images: ghcr.io/${{ github.repository_owner }}/kuberic-operator
         flavor: latest=false
         tags: |
-          type=ref,event=branch
           type=semver,pattern={{version}}
           type=sha
-          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
     - name: Publish kuberic-operator image
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -185,10 +183,8 @@ jobs:
         images: ghcr.io/${{ github.repository_owner }}/kuberic-operator2
         flavor: latest=false
         tags: |
-          type=ref,event=branch
           type=semver,pattern={{version}}
           type=sha
-          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
     - name: Publish kuberic-operator2 image
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -208,10 +204,8 @@ jobs:
         images: ghcr.io/${{ github.repository_owner }}/kvstore
         flavor: latest=false
         tags: |
-          type=ref,event=branch
           type=semver,pattern={{version}}
           type=sha
-          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
     - name: Publish kvstore image
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
