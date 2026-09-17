@@ -2,6 +2,9 @@
 mod gateway_k8s;
 
 #[cfg(test)]
+mod managed_services_k8s;
+
+#[cfg(test)]
 mod lease_election;
 
 #[cfg(test)]
@@ -15,7 +18,7 @@ pub mod test_utils {
         dir.parent().unwrap().to_path_buf()
     }
 
-    fn isolated_kube_coordinates() -> (String, String) {
+    pub(super) fn isolated_kube_coordinates() -> (String, String) {
         let kubeconfig =
             std::env::var("KUBECONFIG").expect("KinD tests require an isolated KUBECONFIG");
         let context =
