@@ -121,6 +121,9 @@ jobs:
     - name: Test SQLite example
       run: cargo test -p sqlite-replicated --all-features -- --nocapture
 
+    - name: Test SQL Server example
+      run: cargo test -p sqlserver-replicated --all-features -- --nocapture
+
     - name: Test Kubernetes integration
       run: cargo test -p kuberic-tests --all-features -- --nocapture
 
