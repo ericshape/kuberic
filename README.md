@@ -68,7 +68,6 @@ After CI passes, pushes to `main` and version tags publish Linux AMD64 images to
 GitHub Container Registry:
 
 - `ghcr.io/ericshape/kuberic-operator`
-- `ghcr.io/ericshape/kuberic-operator2`
 - `ghcr.io/ericshape/kvstore`
 
 Main-branch images receive immutable commit SHA tags. A semantic version tag
