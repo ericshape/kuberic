@@ -8,8 +8,7 @@ RUN useradd -m -u 10000 appuser
 
 WORKDIR /app
 
-ARG BUILD_PROFILE=debug
-COPY target/${BUILD_PROFILE}/kvstore /app/kvstore
+COPY target/debug/kvstore /app/kvstore
 
 RUN mkdir -p /var/lib/kvstore/data && \
     chown -R appuser:appuser /app /var/lib/kvstore

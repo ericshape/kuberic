@@ -2,4 +2,3 @@
 **
 # but not these files
 !target/debug/
-!target/release/

@@ -8,8 +8,7 @@ RUN useradd -m -u 10000 appuser
 
 WORKDIR /app
 
-ARG BUILD_PROFILE=debug
-COPY target/${BUILD_PROFILE}/kuberic-operator /app/kuberic-operator
+COPY target/debug/kuberic-operator /app/kuberic-operator
 
 RUN chown -R appuser:appuser /app
 
