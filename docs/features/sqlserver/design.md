@@ -21,7 +21,7 @@ The first supported target is deliberately narrow:
 | Platform | Linux x86-64 containers |
 | Edition | Developer for tests; Enterprise for a future production profile |
 | Availability group | Full AG, one managed user database |
-| AG naming | `EXTERNAL` limit of 64 UTF-16 code units |
+| AG naming | `EXTERNAL` limit of 64 characters, enforced as 64 UTF-16 code units |
 | Cluster type | `EXTERNAL` |
 | Topology | Three synchronous data replicas |
 | Failover mode | `EXTERNAL` |
@@ -32,6 +32,15 @@ The first supported target is deliberately narrow:
 
 Images must be pinned by digest. Accepting the SQL Server EULA remains an
 explicit deployer action and is never implied by the adapter.
+
+The AG name limit is narrower than the general `sysname` limit.
+`CREATE AVAILABILITY GROUP` documents 128 characters for `cluster_type = WSFC`
+but 64 for `cluster_type = NONE` and `EXTERNAL`, and the engine enforces it as
+error 19544. Before SQL Server 2022 CU23 an over-length name raised an assertion
+failure rather than that error, so client-side rejection avoids a crash-class
+failure on older builds. Microsoft states the bound in "characters" without
+naming a unit; the adapter counts UTF-16 code units, which is never more
+permissive than counting scalar values.
 
 `CLUSTER_TYPE = NONE` is intentionally excluded. Microsoft documents it as a
 read-scale configuration without high availability. It allows manual T-SQL
@@ -62,6 +71,29 @@ The crate does not yet connect to SQL Server, create an AG, seed a database,
 renew a write lease, change a role, or integrate with either Kuberic operator.
 Mutation configuration is therefore only a contract for later stages, not an
 enabled execution path.
+
+Unlike the PostgreSQL and SQLite examples, `examples/sqlserver` is a pure
+library with no binary target and no dependency on `kuberic-core`. The contract
+is deliberately expressible and testable without the replication runtime, so
+that stage 2 can introduce a runtime against a contract that is already fixed.
+
+Two capabilities named in this design are defined but not yet enforceable, and
+each is assigned to a later stage rather than half-built now:
+
+- **Encoding and decoding.** The canonical writer produces the bytes that the
+  input signature covers, but there is no reader and no `serde` support, so an
+  envelope cannot yet be persisted or sent between processes. Stage 2 owns the
+  decoder together with the durable result journal that needs it.
+  `OperationRequest::from_decoded_parts` exists as the seam that decoder will
+  use, and is the only path on which the contract-version check is reachable.
+- **Proof validity and issuance.** `DestructiveApproval` and `FenceReference`
+  currently bind a receipt to an exact operation ID and canonical input
+  signature. They carry no issue or expiry time and no issuer verification, so
+  the type system cannot yet express an expired or forged proof, and any caller
+  able to construct an envelope can construct a receipt for it. Stage 4 owns
+  receipt lifetime and issuer authentication, alongside the external lease
+  handling that gives those fields their meaning. Until then, no code path may
+  treat the presence of a receipt as evidence that fencing actually occurred.
 
 ## Why the PostgreSQL Adapter Is Not a Drop-in Template
 
@@ -119,6 +151,12 @@ distinguish:
 - a stale last-known observation; and
 - an unsupported engine or protocol state.
 
+Every observation records when the attempt was made, including failed attempts,
+so that a caller can reason about how long evidence has been unavailable. A
+failed observation is never fresh, and an observation stamped in the future is
+also reported as not fresh: clock skew must degrade toward refusing to act, not
+toward trusting an unverifiable sample.
+
 The observer will read and cross-check at least:
 
 - `SERVERPROPERTY(...)` and `@@SERVERNAME`;
@@ -171,9 +209,12 @@ and to permit replacement of an expired proof without changing the requested
 database effect.
 
 An exact duplicate returns the retained result. Reusing an operation ID with
-different canonical input is rejected. A lost response is resolved by
-reobserving the native postcondition; it is not permission to issue a
-conflicting operation.
+different canonical input is rejected. A planner that crashes after dispatch but
+before persisting its intent can regenerate the same native effect under a fresh
+operation ID, so an identical canonical input arriving under a different
+operation ID is reported distinctly and requires reobserving the native
+postcondition. A lost response is resolved the same way; it is not permission to
+issue a conflicting operation.
 
 The initial operation vocabulary is:
 
@@ -255,7 +296,8 @@ slice, but do not need to wait for every #79 operation to be complete.
 Ordinary workspace tests stay independent of SQL Server. Server-free tests
 cover profile rejection, exact progress, malformed observations, canonical
 operation vectors, duplicate/reused operation IDs, epoch regression,
-destructive approval, and fence binding.
+destructive approval, and fence binding. They run in the ordinary CI job as
+`cargo test -p sqlserver-replicated`, alongside the other example crates.
 
 Live tests require a separate explicit job because the current CI installs
 PostgreSQL but not SQL Server. That job must pin the engine, tools, and helper
@@ -273,5 +315,6 @@ reply, and routing publication.
 - [Configure an availability group for high availability on Linux](https://learn.microsoft.com/en-us/sql/linux/business-continuity/availability-groups/configure)
 - [Manage availability group failover on Linux](https://learn.microsoft.com/en-us/sql/linux/business-continuity/availability-groups/failover-high-availability)
 - [`sys.dm_hadr_database_replica_states`](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-hadr-database-replica-states-transact-sql)
+- [`CREATE AVAILABILITY GROUP`](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-availability-group-transact-sql) — `EXTERNAL` AG name limit
 - [Microsoft `mssql-server-ha` resource agents](https://github.com/microsoft/mssql-server-ha)
 - [Microsoft SQL Server AGs on Kubernetes with DxOperator](https://learn.microsoft.com/en-us/sql/linux/business-continuity/containers/tutorial-kubernetes-dxoperator)

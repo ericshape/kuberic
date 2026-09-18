@@ -3,12 +3,19 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+use crate::config::{SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT};
 use crate::error::ContractError;
 use crate::types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
     DecimalProgress, Endpoint, Guid, OpaqueId, ReplicaDescriptor, ReplicaIdentity, SqlIdentifier,
 };
 
+/// Version of the canonical operation encoding.
+///
+/// [`OperationRequest::new`] always stamps this value, so the version check in
+/// [`OperationRequest::validate`] is only reachable through
+/// [`OperationRequest::from_decoded_parts`], which is the entry point a decoder
+/// will use once stage 2 of the delivery sequence introduces one.
 pub const OPERATION_CONTRACT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,10 +97,10 @@ impl OperationPayload {
     fn validate(&self) -> Result<(), ContractError> {
         match self {
             Self::EnsureAvailabilityGroup { replicas, .. } => {
-                if replicas.len() != 3 {
+                if replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT) {
                     return Err(ContractError::UnsupportedProfile {
                         field: "operation replica count",
-                        expected: "3",
+                        expected: SUPPORTED_REPLICA_COUNT_TEXT,
                         actual: replicas.len().to_string(),
                     });
                 }
@@ -113,7 +120,7 @@ impl OperationPayload {
                             value: replica.identity.logical_id().to_string(),
                         });
                     }
-                    if !names.insert(replica.server_name.as_str().to_ascii_lowercase()) {
+                    if !names.insert(replica.server_name.clone()) {
                         return Err(ContractError::DuplicateValue {
                             field: "server name",
                             value: replica.server_name.to_string(),
@@ -175,7 +182,10 @@ impl OperationPayload {
                                 .cmp(right.identity.incarnation())
                         })
                 });
-                writer.u32(replicas.len() as u32);
+                writer.u32(
+                    u32::try_from(replicas.len())
+                        .expect("replica count is bounded by the supported profile"),
+                );
                 for replica in replicas {
                     writer.replica(&replica.identity);
                     writer.string(replica.server_name.as_str());
@@ -324,6 +334,37 @@ impl OperationRequest {
     ) -> Result<Self, ContractError> {
         let request = Self {
             contract_version: OPERATION_CONTRACT_VERSION,
+            resource_id: OpaqueId::new("resource ID", resource_id)?,
+            operation_id: OpaqueId::new("operation ID", operation_id)?,
+            source_configuration_id: OpaqueId::new(
+                "source configuration ID",
+                source_configuration_id,
+            )?,
+            source_epoch,
+            target_epoch,
+            payload,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Rebuilds a request from previously encoded parts, validating the contract
+    /// version before anything else is trusted.
+    ///
+    /// This is the seam a decoder plugs into. Until stage 2 of the delivery
+    /// sequence adds one, it exists so that the version check is reachable and
+    /// testable rather than unreachable by construction.
+    pub fn from_decoded_parts(
+        contract_version: u16,
+        resource_id: impl Into<String>,
+        operation_id: impl Into<String>,
+        source_configuration_id: impl Into<String>,
+        source_epoch: u64,
+        target_epoch: u64,
+        payload: OperationPayload,
+    ) -> Result<Self, ContractError> {
+        let request = Self {
+            contract_version,
             resource_id: OpaqueId::new("resource ID", resource_id)?,
             operation_id: OpaqueId::new("operation ID", operation_id)?,
             source_configuration_id: OpaqueId::new(
@@ -538,14 +579,25 @@ impl OperationRecord {
         self.input_signature
     }
 
+    /// Classifies a candidate against a retained terminal result.
+    ///
+    /// The retained operation ID alone is not a sufficient key. A planner that
+    /// crashes after dispatch but before persisting its intent can regenerate
+    /// the same native effect under a fresh operation ID, so an identical
+    /// canonical input under a different ID is reported separately rather than
+    /// being treated as unrelated work.
     pub fn classify(
         &self,
         candidate: &OperationEnvelope,
     ) -> Result<ReplayDisposition, ContractError> {
+        let candidate_signature = candidate.input_signature();
         if self.operation_id != candidate.request.operation_id {
+            if self.input_signature == candidate_signature {
+                return Ok(ReplayDisposition::DuplicateInputNewOperationId);
+            }
             return Ok(ReplayDisposition::DifferentOperation);
         }
-        if self.input_signature != candidate.input_signature() {
+        if self.input_signature != candidate_signature {
             return Err(ContractError::OperationIdReuse);
         }
         Ok(ReplayDisposition::ExactDuplicate)
@@ -554,7 +606,13 @@ impl OperationRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayDisposition {
+    /// Same operation ID and same canonical input: the retained result applies.
     ExactDuplicate,
+    /// Same canonical input under a different operation ID. The requested native
+    /// effect may already have been applied, so the caller must reobserve the
+    /// native postcondition instead of dispatching again.
+    DuplicateInputNewOperationId,
+    /// Unrelated work.
     DifferentOperation,
 }
 
@@ -585,7 +643,9 @@ impl CanonicalWriter {
     }
 
     fn bytes(&mut self, value: &[u8]) {
-        self.u32(value.len() as u32);
+        let length = u32::try_from(value.len())
+            .expect("canonical operation fields are bounded well below 4 GiB");
+        self.u32(length);
         self.bytes.extend_from_slice(value);
     }
 

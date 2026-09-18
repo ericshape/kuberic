@@ -2,9 +2,28 @@ use std::fmt;
 
 use crate::error::ContractError;
 
+/// `sysname` is `nvarchar(128)`, so SQL identifiers are bounded in UTF-16 code
+/// units rather than bytes. Opaque Kuberic-side identifiers never reach SQL
+/// Server, so they are bounded in bytes instead.
 const MAX_SQL_IDENTIFIER_UTF16: usize = 128;
-const MAX_EXTERNAL_AG_NAME_UTF16: usize = 64;
 const MAX_OPAQUE_ID_BYTES: usize = 256;
+
+/// `CREATE AVAILABILITY GROUP` documents a narrower limit for the cluster types
+/// that have no WSFC behind them: "The maximum length for an availability group
+/// name is 128 characters for `cluster_type = WSFC` and 64 characters for
+/// `cluster_type = NONE` and `EXTERNAL`."
+///
+/// The engine enforces this as error 19544. Before SQL Server 2022 CU23 an
+/// over-length name raised an assertion failure instead, so rejecting it here
+/// guards against a crash-class failure on older builds rather than merely
+/// anticipating an error.
+///
+/// Microsoft states the bound in "characters" without naming a unit. Counting
+/// UTF-16 code units is never more permissive than counting scalar values, so
+/// this is the fail-closed reading.
+///
+/// <https://learn.microsoft.com/en-us/sql/t-sql/statements/create-availability-group-transact-sql>
+const MAX_EXTERNAL_AG_NAME_UTF16: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SqlIdentifier(String);
@@ -76,6 +95,37 @@ impl AvailabilityGroupName {
 }
 
 impl fmt::Display for AvailabilityGroupName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A SQL Server instance name as reported by `@@SERVERNAME`.
+///
+/// SQL Server instance names are case-insensitive, so the value is lowercased at
+/// construction. Normalizing here rather than at each use keeps duplicate
+/// detection and canonical operation encoding from disagreeing about whether two
+/// spellings name the same instance.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServerName(SqlIdentifier);
+
+impl ServerName {
+    pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
+        let mut value = value.into();
+        value.make_ascii_lowercase();
+        Ok(Self(SqlIdentifier::new(value)?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn quoted(&self) -> String {
+        self.0.quoted()
+    }
+}
+
+impl fmt::Display for ServerName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -311,7 +361,7 @@ impl ReplicaIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaDescriptor {
     pub identity: ReplicaIdentity,
-    pub server_name: SqlIdentifier,
+    pub server_name: ServerName,
     pub endpoint: Endpoint,
 }
 
@@ -339,7 +389,24 @@ pub enum NativeRole {
     Secondary,
     Resolving,
     NotJoined,
-    Unknown(String),
+    Unknown(OpaqueId),
+}
+
+impl NativeRole {
+    /// Classifies a role string reported by SQL Server.
+    ///
+    /// Unrecognized roles are retained rather than discarded so that an
+    /// unsupported engine state stays distinguishable from a known role, but the
+    /// server-supplied text is validated like any other external input.
+    pub fn parse(value: &str) -> Result<Self, ContractError> {
+        Ok(match value {
+            "PRIMARY" => Self::Primary,
+            "SECONDARY" => Self::Secondary,
+            "RESOLVING" => Self::Resolving,
+            "NOT_JOINED" => Self::NotJoined,
+            other => Self::Unknown(OpaqueId::new("native replica role", other)?),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +429,7 @@ pub enum ObservationFailureKind {
 pub struct ObservationFailure {
     pub kind: ObservationFailureKind,
     pub message: String,
+    pub observed_at_unix_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +445,30 @@ pub enum Observation<T> {
 }
 
 impl<T> Observation<T> {
+    /// Returns when the observation attempt was made, including failed attempts.
+    ///
+    /// A failed attempt still carries a timestamp so that callers can reason
+    /// about how long evidence has been unavailable, which lease and fencing
+    /// decisions depend on.
+    pub fn observed_at_unix_millis(&self) -> u64 {
+        match self {
+            Self::Present {
+                observed_at_unix_millis,
+                ..
+            }
+            | Self::Absent {
+                observed_at_unix_millis,
+            } => *observed_at_unix_millis,
+            Self::Failed(failure) => failure.observed_at_unix_millis,
+        }
+    }
+
+    /// Reports whether this observation is usable evidence at `now_unix_millis`.
+    ///
+    /// A failed observation is never fresh: it carries no evidence about the
+    /// native state. An observation stamped in the future is also reported as
+    /// not fresh, so clock skew degrades toward refusing to act rather than
+    /// toward trusting an unverifiable sample.
     pub fn is_fresh_at(&self, now_unix_millis: u64, max_age_millis: u64) -> bool {
         match self {
             Self::Present {
