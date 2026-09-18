@@ -3,12 +3,19 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+use crate::config::{SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT};
 use crate::error::ContractError;
 use crate::types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
     DecimalProgress, Endpoint, Guid, OpaqueId, ReplicaDescriptor, ReplicaIdentity, SqlIdentifier,
 };
 
+/// Version of the canonical operation encoding.
+///
+/// [`OperationRequest::new`] always stamps this value, so the version check in
+/// [`OperationRequest::validate`] is only reachable through
+/// [`OperationRequest::from_decoded_parts`], which is the entry point a decoder
+/// will use once stage 2 of the delivery sequence introduces one.
 pub const OPERATION_CONTRACT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,10 +97,10 @@ impl OperationPayload {
     fn validate(&self) -> Result<(), ContractError> {
         match self {
             Self::EnsureAvailabilityGroup { replicas, .. } => {
-                if replicas.len() != 3 {
+                if replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT) {
                     return Err(ContractError::UnsupportedProfile {
                         field: "operation replica count",
-                        expected: "3",
+                        expected: SUPPORTED_REPLICA_COUNT_TEXT,
                         actual: replicas.len().to_string(),
                     });
                 }
@@ -113,7 +120,7 @@ impl OperationPayload {
                             value: replica.identity.logical_id().to_string(),
                         });
                     }
-                    if !names.insert(replica.server_name.as_str().to_ascii_lowercase()) {
+                    if !names.insert(replica.server_name.clone()) {
                         return Err(ContractError::DuplicateValue {
                             field: "server name",
                             value: replica.server_name.to_string(),
@@ -175,7 +182,10 @@ impl OperationPayload {
                                 .cmp(right.identity.incarnation())
                         })
                 });
-                writer.u32(replicas.len() as u32);
+                writer.u32(
+                    u32::try_from(replicas.len())
+                        .expect("replica count is bounded by the supported profile"),
+                );
                 for replica in replicas {
                     writer.replica(&replica.identity);
                     writer.string(replica.server_name.as_str());
@@ -338,6 +348,37 @@ impl OperationRequest {
         Ok(request)
     }
 
+    /// Rebuilds a request from previously encoded parts, validating the contract
+    /// version before anything else is trusted.
+    ///
+    /// This is the seam a decoder plugs into. Until stage 2 of the delivery
+    /// sequence adds one, it exists so that the version check is reachable and
+    /// testable rather than unreachable by construction.
+    pub fn from_decoded_parts(
+        contract_version: u16,
+        resource_id: impl Into<String>,
+        operation_id: impl Into<String>,
+        source_configuration_id: impl Into<String>,
+        source_epoch: u64,
+        target_epoch: u64,
+        payload: OperationPayload,
+    ) -> Result<Self, ContractError> {
+        let request = Self {
+            contract_version,
+            resource_id: OpaqueId::new("resource ID", resource_id)?,
+            operation_id: OpaqueId::new("operation ID", operation_id)?,
+            source_configuration_id: OpaqueId::new(
+                "source configuration ID",
+                source_configuration_id,
+            )?,
+            source_epoch,
+            target_epoch,
+            payload,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.contract_version != OPERATION_CONTRACT_VERSION {
             return Err(ContractError::UnsupportedProfile {
@@ -403,11 +444,34 @@ impl OperationRequest {
         writer.finish()
     }
 
+    /// Encodes the requested database effect, excluding the operation identity.
+    ///
+    /// Two requests share a canonical effect when they ask SQL Server for the
+    /// same thing, even if a planner restart gave them different operation IDs.
+    /// The distinct domain-separation prefix keeps this encoding from colliding
+    /// with [`Self::canonical_input`].
+    pub fn canonical_effect(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::default();
+        writer.bytes(b"kuberic.sqlserver.operation.effect");
+        writer.u16(self.contract_version);
+        writer.string(self.resource_id.as_str());
+        writer.string(self.source_configuration_id.as_str());
+        writer.u64(self.source_epoch);
+        writer.u64(self.target_epoch);
+        self.payload.encode(&mut writer);
+        writer.finish()
+    }
+
     pub fn input_signature(&self) -> InputSignature {
-        let digest = Sha256::digest(self.canonical_input());
-        let mut bytes = [0_u8; 32];
-        bytes.copy_from_slice(&digest);
-        InputSignature(bytes)
+        InputSignature(digest(&self.canonical_input()))
+    }
+
+    /// Digest over [`Self::canonical_effect`].
+    ///
+    /// This is a duplicate-effect detector, not an idempotency key: unlike
+    /// [`Self::input_signature`] it deliberately ignores the operation ID.
+    pub fn effect_signature(&self) -> EffectSignature {
+        EffectSignature(digest(&self.canonical_effect()))
     }
 }
 
@@ -495,6 +559,14 @@ impl OperationEnvelope {
     pub fn input_signature(&self) -> InputSignature {
         self.request.input_signature()
     }
+
+    pub fn canonical_effect(&self) -> Vec<u8> {
+        self.request.canonical_effect()
+    }
+
+    pub fn effect_signature(&self) -> EffectSignature {
+        self.request.effect_signature()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -508,18 +580,45 @@ impl InputSignature {
 
 impl fmt::Display for InputSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("sha256:")?;
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        write_digest(f, &self.0)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EffectSignature([u8; 32]);
+
+impl EffectSignature {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EffectSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_digest(f, &self.0)
+    }
+}
+
+fn digest(value: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(value);
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn write_digest(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
+    f.write_str("sha256:")?;
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationRecord {
     operation_id: OpaqueId,
     input_signature: InputSignature,
+    effect_signature: EffectSignature,
 }
 
 impl OperationRecord {
@@ -527,6 +626,7 @@ impl OperationRecord {
         Self {
             operation_id: envelope.request.operation_id.clone(),
             input_signature: envelope.input_signature(),
+            effect_signature: envelope.effect_signature(),
         }
     }
 
@@ -538,11 +638,25 @@ impl OperationRecord {
         self.input_signature
     }
 
+    pub fn effect_signature(&self) -> EffectSignature {
+        self.effect_signature
+    }
+
+    /// Classifies a candidate against a retained terminal result.
+    ///
+    /// The retained operation ID alone is not a sufficient key. A planner that
+    /// crashes after dispatch but before persisting its intent can regenerate
+    /// the same native effect under a fresh operation ID, so a candidate that
+    /// requests an identical effect under a different ID is reported separately
+    /// rather than being treated as unrelated work.
     pub fn classify(
         &self,
         candidate: &OperationEnvelope,
     ) -> Result<ReplayDisposition, ContractError> {
         if self.operation_id != candidate.request.operation_id {
+            if self.effect_signature == candidate.effect_signature() {
+                return Ok(ReplayDisposition::DuplicateEffectNewOperationId);
+            }
             return Ok(ReplayDisposition::DifferentOperation);
         }
         if self.input_signature != candidate.input_signature() {
@@ -554,7 +668,13 @@ impl OperationRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayDisposition {
+    /// Same operation ID and same canonical input: the retained result applies.
     ExactDuplicate,
+    /// A different operation ID requesting an identical native effect. The
+    /// effect may already have been applied, so the caller must reobserve the
+    /// native postcondition instead of dispatching again.
+    DuplicateEffectNewOperationId,
+    /// Unrelated work.
     DifferentOperation,
 }
 
@@ -585,7 +705,9 @@ impl CanonicalWriter {
     }
 
     fn bytes(&mut self, value: &[u8]) {
-        self.u32(value.len() as u32);
+        let length = u32::try_from(value.len())
+            .expect("canonical operation fields are bounded well below 4 GiB");
+        self.u32(length);
         self.bytes.extend_from_slice(value);
     }
 
