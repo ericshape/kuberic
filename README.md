@@ -83,6 +83,11 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the one-task-per-branch workflow,
+agent ownership rules, pull request requirements, and merge policy.
+
 ## License
 
 [MIT](LICENSE)

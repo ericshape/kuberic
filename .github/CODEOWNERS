@@ -1,0 +1,15 @@
+# Default review owner.
+* @ericshape
+
+# Repository policy and shared workspace files.
+/.github/ @ericshape
+/Cargo.toml @ericshape
+/Cargo.lock @ericshape
+
+# High-conflict protocol, operator, example, and integration-test areas.
+/kuberic-core/ @ericshape
+/kuberic-dex/ @ericshape
+/kuberic-operator/ @ericshape
+/kuberic-operator2/ @ericshape
+/examples/ @ericshape
+/kuberic-tests/ @ericshape
