@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, Client};
@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
+    let services: Api<Service> = Api::all(client.clone());
 
     let ctx = Arc::new(Context {
         api: KubeClusterApi {
@@ -110,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sets_controller = async move {
         Controller::new(sets, watcher::Config::default())
             .owns(pods, watcher::Config::default())
+            .owns(services, watcher::Config::default())
             .run(
                 |set: Arc<KubericSet>, ctx: Arc<Context>| async move {
                     match kuberic_operator::reconciler::reconcile_set(&set, &ctx.api, &ctx.state)
