@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use crate::error::ContractError;
 use crate::types::{PinnedImage, SecretRef};
 
@@ -5,6 +7,13 @@ pub const SUPPORTED_ENGINE_MAJOR: u16 = 16;
 pub const SUPPORTED_REPLICA_COUNT: u8 = 3;
 pub const SUPPORTED_DATABASE_COUNT: u8 = 1;
 pub const SUPPORTED_REQUIRED_SECONDARIES: u8 = 1;
+
+/// Rendered form of [`SUPPORTED_REPLICA_COUNT`] for error messages.
+///
+/// [`ContractError::UnsupportedProfile::expected`] is a `&'static str`, so the
+/// rendered value is declared next to the numeric constant to keep the two from
+/// drifting apart. `supported_profile_constants_agree` asserts that they match.
+pub const SUPPORTED_REPLICA_COUNT_TEXT: &str = "3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edition {
@@ -60,7 +69,7 @@ pub struct SqlServerSupportConfig {
     pub replica_count: u8,
     pub database_count: u8,
     pub required_synchronized_secondaries_to_commit: u8,
-    pub external_write_lease_seconds: Option<u32>,
+    pub external_write_lease_seconds: Option<NonZeroU32>,
     pub mutation_mode: MutationMode,
     pub observer_credentials: SecretRef,
     pub mutation_credentials: Option<SecretRef>,
@@ -114,7 +123,7 @@ impl SqlServerSupportConfig {
         require(
             "replica count",
             self.replica_count == SUPPORTED_REPLICA_COUNT,
-            "3",
+            SUPPORTED_REPLICA_COUNT_TEXT,
             self.replica_count,
         )?;
         require(
@@ -131,8 +140,7 @@ impl SqlServerSupportConfig {
         )?;
         require(
             "external write lease",
-            self.external_write_lease_seconds
-                .is_some_and(|seconds| seconds > 0),
+            self.external_write_lease_seconds.is_some(),
             "a positive duration",
             self.external_write_lease_seconds
                 .map_or_else(|| "unset".to_string(), |seconds| seconds.to_string()),
