@@ -65,6 +65,10 @@ pub struct KubericSetSpec {
     /// PVC retention policy on CR deletion: Delete (default) or Retain.
     #[serde(default)]
     pub pvc_retention_policy: PvcRetentionPolicy,
+
+    /// Opt-in managed resources, separate from the internal replication Services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<crate::service_config::ManagedSpec>,
 }
 
 /// Status of the KubericSet.
@@ -122,6 +126,10 @@ pub struct KubericSetStatus {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stable_election_metadata_refresh: Option<StableElectionMetadataRefreshStatus>,
+
+    /// Application-facing Service reconciliation; not application or replication readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_services: Option<crate::service_config::ManagedServicesStatus>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]

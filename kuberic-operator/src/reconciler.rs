@@ -435,6 +435,25 @@ pub async fn reconcile_set(
     api: &dyn ClusterApi,
     state: &ReconcilerState,
 ) -> Result<ReconcileAction, String> {
+    if set.metadata.deletion_timestamp.is_some() {
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(30)));
+    }
+    let topology = reconcile_topology(set, api, state).await;
+    // Exposure has its own status and must not prevent topology progress.
+    if let Err(error) = crate::services::reconcile_managed_services(set, api).await {
+        warn!(set = %set.name_any(), %error, "additional Service reconciliation failed");
+        return topology.map(|ReconcileAction::Requeue(delay)| {
+            ReconcileAction::Requeue(delay.min(Duration::from_secs(5)))
+        });
+    }
+    topology
+}
+
+async fn reconcile_topology(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+) -> Result<ReconcileAction, String> {
     let name = set.name_any();
     let namespace = set.namespace().unwrap_or_default();
     let set_key = format!("{}/{}", namespace, name);
@@ -446,7 +465,13 @@ pub async fn reconcile_set(
     // or selecting any further health/topology action.
     let pending_status = { state.pending_statuses.lock().await.get(&set_key).cloned() };
     if let Some(pending) = pending_status {
-        if set.status.as_ref() == Some(&pending) {
+        if set.status.as_ref().is_some_and(|current| {
+            let mut expected = pending.clone();
+            expected
+                .managed_services
+                .clone_from(&current.managed_services);
+            current == &expected
+        }) {
             state.pending_statuses.lock().await.remove(&set_key);
             return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
         }
@@ -2500,6 +2525,10 @@ async fn apply_failover_decision(
                 conditions: Vec::new(),
                 primary_failing_since: None,
                 stable_election_metadata_refresh: None,
+                managed_services: set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.managed_services.clone()),
             };
             persist_committed_status(
                 api,

@@ -1,0 +1,31 @@
+# Optional addition to deploy/gateway/applications.yaml: updates kvstore-a in place.
+# The reference Gateway and its existing routes remain unchanged.
+# A working load-balancer provider is required; no cloud-specific settings are assumed.
+---
+apiVersion: kuberic.io/v1
+kind: KubericSet
+metadata:
+  name: kvstore-a
+  namespace: xedio
+spec:
+  replicas: 3
+  image: localhost/kvstore:latest
+  port: 8080
+  controlPort: 9090
+  dataPort: 9091
+  storage: "256Mi"
+  failoverDelay: 5
+  managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: kvstore-a-client
+            spec:
+              type: LoadBalancer
+              ports:
+                - name: app
+                  protocol: TCP
+                  port: 8080
+                  targetPort: 8080
