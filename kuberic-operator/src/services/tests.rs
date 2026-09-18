@@ -25,8 +25,9 @@ fn allocated(mut service: Service, revision: u64) -> Service {
     service.metadata.uid = Some(format!("service-{revision}"));
     service.metadata.resource_version = Some(revision.to_string());
     let spec = service.spec.as_mut().unwrap();
-    spec.cluster_ip
-        .get_or_insert_with(|| format!("10.0.0.{revision}"));
+    if spec.cluster_ip.as_deref().is_none_or(str::is_empty) {
+        spec.cluster_ip = Some(format!("10.0.0.{revision}"));
+    }
     spec.cluster_ips
         .get_or_insert_with(|| vec![spec.cluster_ip.clone().unwrap()]);
     spec.ip_families
@@ -35,6 +36,9 @@ fn allocated(mut service: Service, revision: u64) -> Service {
         .get_or_insert_with(|| "SingleStack".to_string());
     spec.session_affinity
         .get_or_insert_with(|| "None".to_string());
+    if spec.publish_not_ready_addresses == Some(false) {
+        spec.publish_not_ready_addresses = None;
+    }
     let service_type = spec.type_.as_deref().unwrap_or("ClusterIP");
     if matches!(service_type, "LoadBalancer" | "NodePort") {
         spec.external_traffic_policy
@@ -261,6 +265,25 @@ async fn repeated_reconciliation_and_restart_are_noops_with_stable_identity() {
     let state = api.0.lock().unwrap();
     assert_eq!(state.services["client"], before);
     assert_eq!(state.status, status_before);
+    assert_eq!(state.mutations, ["create:client"]);
+}
+
+#[tokio::test]
+async fn empty_cluster_ip_is_allocated_once_and_preserved_on_reconcile() {
+    let api = FakeApi::default();
+    let mut config = additional("client", "ClusterIP");
+    config["serviceTemplate"]["spec"]["clusterIP"] = json!("");
+    let set = set(vec![config]);
+
+    reconcile_managed_services(&set, &api).await.unwrap();
+    let before = api.0.lock().unwrap().services["client"].clone();
+    let spec = before.spec.as_ref().unwrap();
+    assert!(spec.cluster_ip.as_ref().is_some_and(|ip| !ip.is_empty()));
+    assert_eq!(spec.publish_not_ready_addresses, None);
+
+    reconcile_managed_services(&set, &api).await.unwrap();
+    let state = api.0.lock().unwrap();
+    assert_eq!(state.services["client"], before);
     assert_eq!(state.mutations, ["create:client"]);
 }
 

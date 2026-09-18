@@ -58,6 +58,9 @@ fn template(service: &Service) -> Result<AppliedTemplate, String> {
         .clone()
         .ok_or_else(|| "additional Service has no spec".to_string())?;
     spec.type_.get_or_insert_with(|| "ClusterIP".to_string());
+    if spec.cluster_ip.as_deref() == Some("") {
+        spec.cluster_ip = None;
+    }
     spec.publish_not_ready_addresses = Some(false);
     for port in spec.ports.iter_mut().flatten() {
         port.protocol.get_or_insert_with(|| "TCP".to_string());
@@ -249,7 +252,13 @@ fn for_update(live: &Service, desired: &Service) -> Result<Option<Service>, Stri
         TEMPLATE_ANNOTATION.to_string(),
         serde_json::to_string(&desired_template).map_err(|e| e.to_string())?,
     );
-    if updated == *live {
+    let normalize = |mut service: Service| {
+        if let Some(spec) = service.spec.as_mut() {
+            spec.publish_not_ready_addresses.get_or_insert(false);
+        }
+        service
+    };
+    if normalize(updated.clone()) == normalize(live.clone()) {
         Ok(None)
     } else {
         Ok(Some(updated))
