@@ -737,7 +737,8 @@ async fn managed_services_scenario() {
     let name = format!("managed-client-{:08x}", rand::random::<u32>());
     let external_name = format!("{name}-external");
     let lb_name = format!("{name}-lb");
-    let nodeport = service_template(&external_name, "NodePort");
+    let mut nodeport = service_template(&external_name, "NodePort");
+    nodeport["serviceTemplate"]["spec"]["clusterIP"] = json!("");
     let mut load_balancer = service_template(&lb_name, "LoadBalancer");
     load_balancer["serviceTemplate"]["spec"]["loadBalancerClass"] =
         json!("test.kuberic.io/no-controller");
@@ -790,6 +791,40 @@ async fn managed_services_scenario() {
             ("kuberic.io/set".into(), name.clone()),
             ("kuberic.io/role".into(), "primary".into()),
         ]))
+    );
+    assert_eq!(external_spec.publish_not_ready_addresses, None);
+
+    let reconciled = sets
+        .patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(json!({
+                "metadata": {"uid": set_uid},
+                "spec": {"failoverDelay": 6}
+            })),
+        )
+        .await
+        .expect("force another managed-Service reconciliation");
+    let reconciled_generation = reconciled.metadata.generation;
+    wait_set(&sets, &name, |set| {
+        set.data["status"]["managedServices"]["observedGeneration"].as_i64()
+            == reconciled_generation
+            && set.data["status"]["managedServices"]["conditions"][0]["reason"]
+                == "AwaitingLoadBalancer"
+    })
+    .await;
+    let external_reconciled = services.get(&external_name).await.unwrap();
+    assert_eq!(
+        external_reconciled.metadata.uid,
+        external_before.metadata.uid
+    );
+    assert_eq!(
+        external_reconciled.spec.as_ref().unwrap().cluster_ip,
+        external_spec.cluster_ip
+    );
+    assert_eq!(
+        external_reconciled.metadata.resource_version, external_before.metadata.resource_version,
+        "reconciliation must not replace an unchanged Service"
     );
 
     // TCP passthrough preserves connection lifetime; the shared HTTP listener does not.
