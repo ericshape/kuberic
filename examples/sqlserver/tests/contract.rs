@@ -1,11 +1,14 @@
 use sqlserver_replicated::{
     AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, ClusterType, ContractError,
     DatabaseIdentity, DatabaseLineage, DecimalProgress, DestructiveApproval, Edition, Endpoint,
-    FailoverMode, FenceReference, Guid, MutationMode, Observation, ObservationFailure,
-    ObservationFailureKind, OperationEnvelope, OperationPayload, OperationRecord, OperationRequest,
-    PinnedImage, ReplayDisposition, ReplicaDescriptor, ReplicaIdentity, SecretRef, SeedingMode,
-    SqlIdentifier, SqlServerSupportConfig,
+    FailoverMode, FenceReference, Guid, MutationMode, NativeRole, OPERATION_CONTRACT_VERSION,
+    Observation, ObservationFailure, ObservationFailureKind, OperationEnvelope, OperationPayload,
+    OperationRecord, OperationRequest, PinnedImage, ReplayDisposition, ReplicaDescriptor,
+    ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode,
+    ServerName, SqlIdentifier, SqlServerSupportConfig,
 };
+
+use std::num::NonZeroU32;
 
 fn guid(value: u32) -> Guid {
     Guid::parse(
@@ -31,7 +34,7 @@ fn desired_replica(value: u32) -> ReplicaIdentity {
 fn descriptor(value: u32) -> ReplicaDescriptor {
     ReplicaDescriptor {
         identity: desired_replica(value),
-        server_name: SqlIdentifier::new(format!("sql-{value}")).unwrap(),
+        server_name: ServerName::new(format!("sql-{value}")).unwrap(),
         endpoint: Endpoint::new(format!("sql-{value}.sql.default.svc"), 5022).unwrap(),
     }
 }
@@ -61,7 +64,7 @@ fn supported_config() -> SqlServerSupportConfig {
         replica_count: 3,
         database_count: 1,
         required_synchronized_secondaries_to_commit: 1,
-        external_write_lease_seconds: Some(60),
+        external_write_lease_seconds: NonZeroU32::new(60),
         mutation_mode: MutationMode::ObserveOnly,
         observer_credentials: secret("sqlserver-observer", "password"),
         mutation_credentials: None,
@@ -245,6 +248,7 @@ fn observation_does_not_collapse_absence_failure_or_staleness() {
     let failed = Observation::<u8>::Failed(ObservationFailure {
         kind: ObservationFailureKind::Unreachable,
         message: "connection timed out".to_string(),
+        observed_at_unix_millis: 1_000,
     });
 
     assert!(present.is_fresh_at(1_100, 100));
@@ -252,6 +256,12 @@ fn observation_does_not_collapse_absence_failure_or_staleness() {
     assert!(!present.is_fresh_at(1_101, 100));
     assert!(!failed.is_fresh_at(1_000, 100));
     assert!(!present.is_fresh_at(999, 100));
+
+    // A failure is never fresh, but it still records when the attempt was made
+    // so that callers can tell how long evidence has been unavailable.
+    assert_eq!(failed.observed_at_unix_millis(), 1_000);
+    assert_eq!(present.observed_at_unix_millis(), 1_000);
+    assert_eq!(absent.observed_at_unix_millis(), 1_000);
 }
 
 #[test]
@@ -333,7 +343,7 @@ fn bootstrap_uses_desired_identity_before_sql_server_generates_replica_guids() {
             replicas: vec![
                 ReplicaDescriptor {
                     identity: replica(1),
-                    server_name: SqlIdentifier::new("sql-1").unwrap(),
+                    server_name: ServerName::new("sql-1").unwrap(),
                     endpoint: Endpoint::new("sql-1.sql.default.svc", 5022).unwrap(),
                 },
                 descriptor(2),
@@ -764,12 +774,12 @@ fn endpoints_are_dns_canonical_and_duplicate_detection_is_case_insensitive() {
             replicas: vec![
                 ReplicaDescriptor {
                     identity: desired_replica(1),
-                    server_name: SqlIdentifier::new("sql-1").unwrap(),
+                    server_name: ServerName::new("sql-1").unwrap(),
                     endpoint: lower,
                 },
                 ReplicaDescriptor {
                     identity: desired_replica(2),
-                    server_name: SqlIdentifier::new("sql-2").unwrap(),
+                    server_name: ServerName::new("sql-2").unwrap(),
                     endpoint: upper,
                 },
                 descriptor(3),
@@ -793,6 +803,239 @@ fn external_availability_group_name_has_a_64_character_limit() {
         Err(ContractError::InvalidLength {
             field: "EXTERNAL availability group name",
             max: 64
+        })
+    );
+}
+
+#[test]
+fn server_name_case_does_not_change_the_idempotency_key() {
+    // Duplicate detection treats server names case-insensitively, so the
+    // canonical encoding must agree. Otherwise a controller that re-renders
+    // @@SERVERNAME with different casing turns an idempotent retry into a
+    // hard OperationIdReuse error.
+    let bootstrap = |first: &str| {
+        request(
+            "bootstrap-1",
+            0,
+            1,
+            OperationPayload::EnsureAvailabilityGroup {
+                name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
+                expected_group_id: None,
+                database_name: SqlIdentifier::new("application").unwrap(),
+                replicas: vec![
+                    ReplicaDescriptor {
+                        identity: desired_replica(1),
+                        server_name: ServerName::new(first).unwrap(),
+                        endpoint: Endpoint::new("sql-1.sql.default.svc", 5022).unwrap(),
+                    },
+                    descriptor(2),
+                    descriptor(3),
+                ],
+            },
+        )
+    };
+
+    let lower = bootstrap("sql-1");
+    let upper = bootstrap("SQL-1");
+    assert_eq!(upper.payload(), lower.payload());
+    assert_eq!(upper.input_signature(), lower.input_signature());
+
+    let record =
+        OperationRecord::from_envelope(&OperationEnvelope::new(lower, None, None).unwrap());
+    let retry = OperationEnvelope::new(upper, None, None).unwrap();
+    assert_eq!(
+        record.classify(&retry),
+        Ok(ReplayDisposition::ExactDuplicate)
+    );
+}
+
+#[test]
+fn server_names_that_differ_only_by_case_are_rejected_as_duplicates() {
+    let result = OperationRequest::new(
+        "default/example",
+        "bootstrap-1",
+        "configuration-1",
+        0,
+        1,
+        OperationPayload::EnsureAvailabilityGroup {
+            name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
+            expected_group_id: None,
+            database_name: SqlIdentifier::new("application").unwrap(),
+            replicas: vec![
+                descriptor(1),
+                ReplicaDescriptor {
+                    identity: desired_replica(2),
+                    server_name: ServerName::new("SQL-1").unwrap(),
+                    endpoint: Endpoint::new("sql-2.sql.default.svc", 5022).unwrap(),
+                },
+                descriptor(3),
+            ],
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ContractError::DuplicateValue {
+            field: "server name",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn identical_effect_under_a_new_operation_id_is_not_treated_as_unrelated_work() {
+    // A planner that crashes after dispatch but before persisting its intent
+    // can regenerate the same native effect under a fresh operation ID.
+    let payload = || OperationPayload::ReseedReplica {
+        availability_group: availability_group(),
+        database: database(),
+        source: replica(1),
+        target: replica(2),
+    };
+    let envelope = |operation_id: &str| {
+        let inner = request(operation_id, 4, 4, payload());
+        let approval =
+            DestructiveApproval::new("approval-1", inner.operation_id(), inner.input_signature())
+                .unwrap();
+        let fence = fence(&inner, replica(2));
+        OperationEnvelope::new(inner, Some(approval), Some(fence)).unwrap()
+    };
+
+    let record = OperationRecord::from_envelope(&envelope("reseed-1"));
+    assert_eq!(
+        record.classify(&envelope("reseed-1")),
+        Ok(ReplayDisposition::ExactDuplicate)
+    );
+    assert_eq!(
+        record.classify(&envelope("reseed-2")),
+        Ok(ReplayDisposition::DuplicateEffectNewOperationId)
+    );
+
+    // The operation ID is part of the idempotency key but not part of the
+    // effect, and the two digests are domain-separated.
+    assert_ne!(
+        envelope("reseed-1").input_signature(),
+        envelope("reseed-2").input_signature()
+    );
+    assert_eq!(
+        envelope("reseed-1").effect_signature(),
+        envelope("reseed-2").effect_signature()
+    );
+    assert_ne!(
+        envelope("reseed-1").canonical_input(),
+        envelope("reseed-1").canonical_effect()
+    );
+    assert_ne!(
+        envelope("reseed-1").input_signature().as_bytes(),
+        envelope("reseed-1").effect_signature().as_bytes()
+    );
+
+    let unrelated = request(
+        "join-9",
+        4,
+        4,
+        OperationPayload::EnsureReplicaJoined {
+            availability_group: availability_group(),
+            target: replica(3),
+        },
+    );
+    assert_eq!(
+        record.classify(&OperationEnvelope::new(unrelated, None, None).unwrap()),
+        Ok(ReplayDisposition::DifferentOperation)
+    );
+}
+
+#[test]
+fn decoded_requests_must_carry_a_supported_contract_version() {
+    let payload = || OperationPayload::EnsureReplicaJoined {
+        availability_group: availability_group(),
+        target: replica(1),
+    };
+    assert!(
+        OperationRequest::from_decoded_parts(
+            OPERATION_CONTRACT_VERSION,
+            "default/example",
+            "join-1",
+            "configuration-1",
+            1,
+            1,
+            payload(),
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        OperationRequest::from_decoded_parts(
+            OPERATION_CONTRACT_VERSION + 1,
+            "default/example",
+            "join-1",
+            "configuration-1",
+            1,
+            1,
+            payload(),
+        ),
+        Err(ContractError::UnsupportedProfile {
+            field: "operation contract version",
+            expected: "1",
+            actual: (OPERATION_CONTRACT_VERSION + 1).to_string(),
+        })
+    );
+}
+
+#[test]
+fn supported_profile_constants_agree() {
+    assert_eq!(
+        SUPPORTED_REPLICA_COUNT.to_string(),
+        SUPPORTED_REPLICA_COUNT_TEXT
+    );
+
+    let mut replicas: Vec<ReplicaDescriptor> = (1..=u32::from(SUPPORTED_REPLICA_COUNT))
+        .map(descriptor)
+        .collect();
+    replicas.pop();
+    assert_eq!(
+        OperationRequest::new(
+            "default/example",
+            "bootstrap-1",
+            "configuration-1",
+            0,
+            1,
+            OperationPayload::EnsureAvailabilityGroup {
+                name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
+                expected_group_id: None,
+                database_name: SqlIdentifier::new("application").unwrap(),
+                replicas,
+            },
+        ),
+        Err(ContractError::UnsupportedProfile {
+            field: "operation replica count",
+            expected: SUPPORTED_REPLICA_COUNT_TEXT,
+            actual: (SUPPORTED_REPLICA_COUNT - 1).to_string(),
+        })
+    );
+}
+
+#[test]
+fn unrecognized_native_roles_are_retained_but_validated() {
+    assert_eq!(NativeRole::parse("PRIMARY"), Ok(NativeRole::Primary));
+    assert_eq!(NativeRole::parse("SECONDARY"), Ok(NativeRole::Secondary));
+    assert_eq!(NativeRole::parse("RESOLVING"), Ok(NativeRole::Resolving));
+    assert_eq!(NativeRole::parse("NOT_JOINED"), Ok(NativeRole::NotJoined));
+
+    // An unsupported engine state stays distinguishable from a known role ...
+    assert!(matches!(
+        NativeRole::parse("REVALIDATING"),
+        Ok(NativeRole::Unknown(_))
+    ));
+    // ... but server-supplied text is still validated like any other input.
+    assert_eq!(
+        NativeRole::parse(""),
+        Err(ContractError::MissingField {
+            field: "native replica role"
+        })
+    );
+    assert_eq!(
+        NativeRole::parse("PRIMARY\u{0}"),
+        Err(ContractError::InvalidCharacter {
+            field: "native replica role"
         })
     );
 }

@@ -202,6 +202,12 @@ tags, big-endian integers, length-prefixed UTF-8 strings, and sorted set-like
 collections. The input signature is SHA-256 over that encoding. It is an
 idempotency and conflict-detection value, not authentication.
 
+A second digest, the effect signature, covers the same encoding minus the
+operation identity under a distinct domain-separation prefix. It answers a
+different question: whether two requests ask SQL Server for the same thing. The
+input signature cannot answer it, because the operation ID is part of the input
+it covers.
+
 Approval and fence receipts are evidence about a request, not request input.
 Each carries the exact operation ID and canonical input signature that it
 authorizes. They are excluded from that signature to avoid a circular encoding
@@ -211,10 +217,10 @@ database effect.
 An exact duplicate returns the retained result. Reusing an operation ID with
 different canonical input is rejected. A planner that crashes after dispatch but
 before persisting its intent can regenerate the same native effect under a fresh
-operation ID, so an identical canonical input arriving under a different
-operation ID is reported distinctly and requires reobserving the native
-postcondition. A lost response is resolved the same way; it is not permission to
-issue a conflicting operation.
+operation ID, so a request whose effect signature matches a retained result
+under a different operation ID is reported distinctly and requires reobserving
+the native postcondition. A lost response is resolved the same way; it is not
+permission to issue a conflicting operation.
 
 The initial operation vocabulary is:
 

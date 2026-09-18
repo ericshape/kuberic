@@ -444,11 +444,34 @@ impl OperationRequest {
         writer.finish()
     }
 
+    /// Encodes the requested database effect, excluding the operation identity.
+    ///
+    /// Two requests share a canonical effect when they ask SQL Server for the
+    /// same thing, even if a planner restart gave them different operation IDs.
+    /// The distinct domain-separation prefix keeps this encoding from colliding
+    /// with [`Self::canonical_input`].
+    pub fn canonical_effect(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::default();
+        writer.bytes(b"kuberic.sqlserver.operation.effect");
+        writer.u16(self.contract_version);
+        writer.string(self.resource_id.as_str());
+        writer.string(self.source_configuration_id.as_str());
+        writer.u64(self.source_epoch);
+        writer.u64(self.target_epoch);
+        self.payload.encode(&mut writer);
+        writer.finish()
+    }
+
     pub fn input_signature(&self) -> InputSignature {
-        let digest = Sha256::digest(self.canonical_input());
-        let mut bytes = [0_u8; 32];
-        bytes.copy_from_slice(&digest);
-        InputSignature(bytes)
+        InputSignature(digest(&self.canonical_input()))
+    }
+
+    /// Digest over [`Self::canonical_effect`].
+    ///
+    /// This is a duplicate-effect detector, not an idempotency key: unlike
+    /// [`Self::input_signature`] it deliberately ignores the operation ID.
+    pub fn effect_signature(&self) -> EffectSignature {
+        EffectSignature(digest(&self.canonical_effect()))
     }
 }
 
@@ -536,6 +559,14 @@ impl OperationEnvelope {
     pub fn input_signature(&self) -> InputSignature {
         self.request.input_signature()
     }
+
+    pub fn canonical_effect(&self) -> Vec<u8> {
+        self.request.canonical_effect()
+    }
+
+    pub fn effect_signature(&self) -> EffectSignature {
+        self.request.effect_signature()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -549,18 +580,45 @@ impl InputSignature {
 
 impl fmt::Display for InputSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("sha256:")?;
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        write_digest(f, &self.0)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EffectSignature([u8; 32]);
+
+impl EffectSignature {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EffectSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_digest(f, &self.0)
+    }
+}
+
+fn digest(value: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(value);
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn write_digest(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
+    f.write_str("sha256:")?;
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationRecord {
     operation_id: OpaqueId,
     input_signature: InputSignature,
+    effect_signature: EffectSignature,
 }
 
 impl OperationRecord {
@@ -568,6 +626,7 @@ impl OperationRecord {
         Self {
             operation_id: envelope.request.operation_id.clone(),
             input_signature: envelope.input_signature(),
+            effect_signature: envelope.effect_signature(),
         }
     }
 
@@ -579,25 +638,28 @@ impl OperationRecord {
         self.input_signature
     }
 
+    pub fn effect_signature(&self) -> EffectSignature {
+        self.effect_signature
+    }
+
     /// Classifies a candidate against a retained terminal result.
     ///
     /// The retained operation ID alone is not a sufficient key. A planner that
     /// crashes after dispatch but before persisting its intent can regenerate
-    /// the same native effect under a fresh operation ID, so an identical
-    /// canonical input under a different ID is reported separately rather than
-    /// being treated as unrelated work.
+    /// the same native effect under a fresh operation ID, so a candidate that
+    /// requests an identical effect under a different ID is reported separately
+    /// rather than being treated as unrelated work.
     pub fn classify(
         &self,
         candidate: &OperationEnvelope,
     ) -> Result<ReplayDisposition, ContractError> {
-        let candidate_signature = candidate.input_signature();
         if self.operation_id != candidate.request.operation_id {
-            if self.input_signature == candidate_signature {
-                return Ok(ReplayDisposition::DuplicateInputNewOperationId);
+            if self.effect_signature == candidate.effect_signature() {
+                return Ok(ReplayDisposition::DuplicateEffectNewOperationId);
             }
             return Ok(ReplayDisposition::DifferentOperation);
         }
-        if self.input_signature != candidate_signature {
+        if self.input_signature != candidate.input_signature() {
             return Err(ContractError::OperationIdReuse);
         }
         Ok(ReplayDisposition::ExactDuplicate)
@@ -608,10 +670,10 @@ impl OperationRecord {
 pub enum ReplayDisposition {
     /// Same operation ID and same canonical input: the retained result applies.
     ExactDuplicate,
-    /// Same canonical input under a different operation ID. The requested native
+    /// A different operation ID requesting an identical native effect. The
     /// effect may already have been applied, so the caller must reobserve the
     /// native postcondition instead of dispatching again.
-    DuplicateInputNewOperationId,
+    DuplicateEffectNewOperationId,
     /// Unrelated work.
     DifferentOperation,
 }
