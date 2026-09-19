@@ -27,7 +27,7 @@ impl SqlServerInstanceManager {
     }
 
     pub async fn check_startup_capabilities(&self) -> Result<ServerCapabilities, RuntimeError> {
-        check_capabilities(self.executor.as_ref()).await
+        check_capabilities(self.executor.as_ref(), &self.target).await
     }
 
     pub async fn observe_at(&self, observed_at_unix_millis: u64) -> Observation<SqlServerSnapshot> {

@@ -1,7 +1,8 @@
 # SQL Server External-Replication Adapter
 
-> **Status:** Contract only. No SQL Server process, query, topology, or failover
-> effects are enabled by this change.
+> **Status:** Observe only. The adapter can connect to one directly addressed
+> SQL Server replica and report native state, but no topology or failover effects
+> are enabled.
 >
 > **Support level:** Experimental. This is not a Microsoft-supported Kubernetes
 > high-availability solution.
@@ -52,8 +53,8 @@ the initial profile.
 
 ## Current Implementation
 
-The `examples/sqlserver` crate currently implements only the reviewable
-contract needed before database effects are introduced:
+The `examples/sqlserver` crate implements the reviewable contract and
+observe-only runtime needed before database effects are introduced:
 
 - validation of the supported SQL Server profile;
 - immutable image and Kubernetes Secret references;
@@ -63,26 +64,50 @@ contract needed before database effects are introduced:
 - exact SQL Server `numeric(25,0)` progress values without narrowing to
   Kuberic's current `i64` progress type;
 - observations that distinguish present, absent, stale, and failed evidence;
+- a replaceable TDS executor with required TLS certificate verification;
+- startup checks for SQL Server 2022 on Linux, HADR manager state, edition, and
+  observation permissions;
+- immutable, bracketed DMV snapshots with local-versus-primary-reported
+  provenance;
+- exact hardened-block, redone-record, and committed-record positions;
+- periodic health observations that retain the last successful snapshot
+  separately from the latest attempt; and
+- a `sqlserver-observe` JSON-lines CLI that reads credentials from mounted files;
 - versioned operation envelopes with canonical SHA-256 input signatures;
 - explicit destructive approvals and fence references;
 - duplicate-operation and operation-ID-reuse classification.
 
-The crate does not yet connect to SQL Server, create an AG, seed a database,
-renew a write lease, change a role, or integrate with either Kuberic operator.
-Mutation configuration is therefore only a contract for later stages, not an
-enabled execution path.
+The crate does not create an AG, seed a database, renew a write lease, change a
+role, or integrate with either Kuberic operator. Mutation configuration is
+therefore only a contract for later stages, not an enabled execution path.
 
-Unlike the PostgreSQL and SQLite examples, `examples/sqlserver` is a pure
-library with no binary target and no dependency on `kuberic-core`. The contract
-is deliberately expressible and testable without the replication runtime, so
-that stage 2 can introduce a runtime against a contract that is already fixed.
+Unlike the PostgreSQL and SQLite examples, `examples/sqlserver` has no
+dependency on `kuberic-core`. Its binary is an independent observation tool,
+not a replica service. The contract and runtime remain testable without a SQL
+Server process.
+
+The CLI performs one observation by default:
+
+```bash
+cargo run -p sqlserver-replicated --bin sqlserver-observe -- \
+  --host sql-0.sql.default.svc \
+  --username-file /var/run/secrets/sqlserver/observer-username \
+  --password-file /var/run/secrets/sqlserver/observer-password \
+  --tls-ca-certificate /var/run/secrets/sqlserver/tds-ca.crt \
+  --availability-group kuberic-ag \
+  --database application
+```
+
+`--watch` enables periodic observations. Standard output contains JSON lines;
+diagnostics use standard error. The host must directly identify one replica,
+not a load-balanced service.
 
 Two capabilities named in this design are defined but not yet enforceable, and
 each is assigned to a later stage rather than half-built now:
 
 - **Encoding and decoding.** The canonical writer produces the bytes that the
   input signature covers, but there is no reader and no `serde` support, so an
-  envelope cannot yet be persisted or sent between processes. Stage 2 owns the
+  envelope cannot yet be persisted or sent between processes. Stage 3 owns the
   decoder together with the durable result journal that needs it.
   `OperationRequest::from_decoded_parts` exists as the seam that decoder will
   use, and is the only path on which the contract-version check is reachable.
@@ -173,6 +198,27 @@ must not be confused with a primary's potentially stale report about a remote
 replica. The AG identity and local role are sampled again around a multi-query
 observation; a SQL transaction does not make the DMVs a globally atomic
 snapshot.
+
+The stage 2 observer runs its parameterized queries over one TLS-verified TDS
+session. It brackets the detailed reads with the configured server name, AG
+GUID, AG configuration sequence, local replica GUID, and local role. A missing,
+duplicate, malformed, permission-hidden, or changed bracket fails the
+observation. This detects common torn reads but cannot rule out an ABA
+transition that returns to the same tuple.
+
+`numeric(25,0)` values are converted to decimal text by SQL Server, parsed
+without passing through a floating-point or 64-bit value, and serialized as JSON
+strings. SQL `NULL` remains distinct from an empty or missing column.
+
+The health monitor retains two pieces of state: the result and timestamp of the
+latest attempt, and the last successful snapshot with its original timestamp.
+Consumers can therefore diagnose from stale state while freshness checks still
+fail closed.
+
+The TDS client never enables `TrustServerCertificate`. It validates against
+system roots or an explicitly mounted single PEM, CRT, or DER CA certificate,
+and its connection host must match the certificate SAN. Usernames and passwords
+are read from files rather than command-line values.
 
 SQL Server exposes multiple progress concepts. Hardened-block, redone-record,
 and committed-record positions remain distinct exact decimal values. They
@@ -271,16 +317,18 @@ wired into the current operator2 prototype until that work provides:
 - a pure planner that emits at most one authority-changing command; and
 - separate persistence and dispatch reconciliation cycles.
 
-Until then, the SQL Server code remains an independently testable adapter
-library and laboratory tool. It must not modify the classic operator or claim
-automatic Kubernetes failover.
+Until then, the SQL Server code remains an independently testable adapter and
+laboratory tool. Its observation shape is compatible with the level-triggered
+contract and can be adapted to the classic operator, but this is not operator2
+integration. It must not claim automatic Kubernetes failover.
 
 ## Delivery Sequence
 
-1. **Support and safety contract** — the current change: types, validation,
-   canonical operation identity, tests, and this design.
-2. **Runtime and observation** — a replaceable TDS executor, immutable DMV
-   snapshots, freshness, startup capability checks, and an observe-only CLI.
+1. **Support and safety contract** — types, validation, canonical operation
+   identity, tests, and this design.
+2. **Runtime and observation** — the current change: a replaceable TDS executor,
+   immutable DMV snapshots, freshness, startup capability checks, and an
+   observe-only CLI.
 3. **Bootstrap, join, and reseed** — pure convergence decisions, one native
    effect at a time, durable SQL-specific result journal, and automatic-seeding
    postconditions.
@@ -299,11 +347,12 @@ slice, but do not need to wait for every #79 operation to be complete.
 
 ## Test Gates
 
-Ordinary workspace tests stay independent of SQL Server. Server-free tests
-cover profile rejection, exact progress, malformed observations, canonical
-operation vectors, duplicate/reused operation IDs, epoch regression,
-destructive approval, and fence binding. They run in the ordinary CI job as
-`cargo test -p sqlserver-replicated`, alongside the other example crates.
+Ordinary workspace tests stay independent of SQL Server. Server-free tests cover profile rejection, exact progress, malformed and torn
+observations, native GUID cross-checking, local/remote provenance, health
+freshness, canonical operation vectors, duplicate/reused operation IDs, epoch
+regression, destructive approval, and fence binding. They run in the ordinary
+CI job as `cargo test -p sqlserver-replicated`, alongside the other example
+crates.
 
 Live tests require a separate explicit job because the current CI installs
 PostgreSQL but not SQL Server. That job must pin the engine, tools, and helper

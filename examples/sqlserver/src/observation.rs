@@ -37,6 +37,10 @@ SELECT
         AS can_view_any_definition,
     CONVERT(varchar(1), HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY AVAILABILITY GROUP'))
         AS can_alter_any_availability_group,
+    CONVERT(varchar(1), HAS_PERMS_BY_NAME(@P1, 'AVAILABILITY GROUP', 'ALTER'))
+        AS can_alter_target_availability_group,
+    CONVERT(varchar(1), HAS_PERMS_BY_NAME(@P1, 'AVAILABILITY GROUP', 'CONTROL'))
+        AS can_control_target_availability_group,
     CONVERT(varchar(1), IS_SRVROLEMEMBER('sysadmin')) AS is_sysadmin
 FROM sys.dm_os_host_info AS host;
 "#;
@@ -248,6 +252,8 @@ pub struct ServerCapabilities {
     pub can_view_server_performance_state: bool,
     pub can_view_any_definition: bool,
     pub can_alter_any_availability_group: bool,
+    pub can_alter_target_availability_group: bool,
+    pub can_control_target_availability_group: bool,
     pub is_sysadmin: bool,
 }
 
@@ -257,7 +263,10 @@ impl ServerCapabilities {
         if self.is_sysadmin {
             warnings.push("observation principal is a sysadmin");
         }
-        if self.can_alter_any_availability_group {
+        if self.can_alter_any_availability_group
+            || self.can_alter_target_availability_group
+            || self.can_control_target_availability_group
+        {
             warnings.push("observation principal can alter availability groups");
         }
         warnings
@@ -295,7 +304,7 @@ pub struct ReplicaStateSnapshot {
     pub group_id: Guid,
     pub replica_id: Guid,
     pub scope: EvidenceScope,
-    pub role: NativeRole,
+    pub role: Option<NativeRole>,
     pub operational_state: Option<NativeValue>,
     pub connected_state: Option<NativeValue>,
     pub recovery_health: Option<NativeValue>,
@@ -361,9 +370,9 @@ pub struct AutomaticSeedingSnapshot {
     pub is_source: bool,
     pub current_state: NativeValue,
     pub performed_seeding: bool,
-    pub failure_state: i32,
+    pub failure_state: Option<i32>,
     pub failure_state_description: Option<NativeValue>,
-    pub error_code: i32,
+    pub error_code: Option<i32>,
     pub number_of_attempts: u32,
 }
 
@@ -459,11 +468,11 @@ struct ObservationAnchor {
     local_role: NativeRole,
 }
 
-pub(crate) fn capability_queries() -> Vec<TdsQuery> {
+pub(crate) fn capability_queries(target: &ObservationTarget) -> Vec<TdsQuery> {
     vec![TdsQuery::new(
         TdsQueryKind::Capabilities,
         CAPABILITIES_QUERY,
-        [],
+        [target.availability_group.as_str().to_string()],
     )]
 }
 
@@ -471,7 +480,7 @@ pub(crate) fn observation_queries(target: &ObservationTarget) -> Vec<TdsQuery> {
     let group = || target.availability_group.as_str().to_string();
     let database = || target.database.as_str().to_string();
     vec![
-        TdsQuery::new(TdsQueryKind::Capabilities, CAPABILITIES_QUERY, []),
+        TdsQuery::new(TdsQueryKind::Capabilities, CAPABILITIES_QUERY, [group()]),
         TdsQuery::new(TdsQueryKind::AnchorBefore, ANCHOR_QUERY, [group()]),
         TdsQuery::new(
             TdsQueryKind::AvailabilityGroup,
@@ -505,8 +514,9 @@ pub(crate) fn observation_queries(target: &ObservationTarget) -> Vec<TdsQuery> {
 
 pub(crate) async fn check_capabilities(
     executor: &dyn TdsExecutor,
+    target: &ObservationTarget,
 ) -> Result<ServerCapabilities, RuntimeError> {
-    let mut results = executor.execute(&capability_queries()).await?;
+    let mut results = executor.execute(&capability_queries(target)).await?;
     if results.len() != 1 {
         return Err(malformed(
             "capability result sets",
@@ -593,7 +603,7 @@ async fn collect_snapshot(
         .collect();
     if local_states.len() != 1
         || local_states[0].replica_id != anchor_before.local_replica_id
-        || local_states[0].role != anchor_before.local_role
+        || local_states[0].role.as_ref() != Some(&anchor_before.local_role)
     {
         return Err(RuntimeError::InconsistentSnapshot);
     }
@@ -718,6 +728,16 @@ fn parse_capabilities(rows: TdsResultSet) -> Result<ServerCapabilities, RuntimeE
             &row,
             "can_alter_any_availability_group",
         )?,
+        can_alter_target_availability_group: parse_bool_optional(
+            &row,
+            "can_alter_target_availability_group",
+        )?
+        .unwrap_or(false),
+        can_control_target_availability_group: parse_bool_optional(
+            &row,
+            "can_control_target_availability_group",
+        )?
+        .unwrap_or(false),
         is_sysadmin: parse_bool_required(&row, "is_sysadmin")?,
     })
 }
@@ -831,7 +851,7 @@ fn parse_replica_states(rows: TdsResultSet) -> Result<Vec<ReplicaStateSnapshot>,
                 group_id: parse_guid(&row, "group_id")?,
                 replica_id: parse_guid(&row, "replica_id")?,
                 scope: parse_scope(&row)?,
-                role: parse_role(&row, "role", "role_desc")?,
+                role: parse_optional_role(&row, "role", "role_desc")?,
                 operational_state: native_optional(&row, "operational_state_desc")?,
                 connected_state: native_optional(&row, "connected_state_desc")?,
                 recovery_health: native_optional(&row, "recovery_health_desc")?,
@@ -1012,9 +1032,9 @@ fn parse_automatic_seeding(
                 is_source: parse_bool_required(&row, "is_source")?,
                 current_state: native_required(&row, "current_state")?,
                 performed_seeding: parse_bool_required(&row, "performed_seeding")?,
-                failure_state: parse_required(&row, "failure_state")?,
+                failure_state: parse_optional(&row, "failure_state")?,
                 failure_state_description: native_optional(&row, "failure_state_desc")?,
-                error_code: parse_required(&row, "error_code")?,
+                error_code: parse_optional(&row, "error_code")?,
                 number_of_attempts: parse_required(&row, "number_of_attempts")?,
             })
         })
@@ -1149,6 +1169,25 @@ fn evaluate_health(
     } else {
         issues.push("local replica state is missing".to_string());
     }
+    if matches!(local_role, NativeRole::Primary) {
+        let healthy_secondaries = replica_states
+            .iter()
+            .filter(|state| {
+                state.scope == EvidenceScope::PrimaryReportedRemote
+                    && state.connected_state.as_ref().map(NativeValue::as_str) == Some("CONNECTED")
+                    && state
+                        .synchronization_health
+                        .as_ref()
+                        .map(NativeValue::as_str)
+                        == Some("HEALTHY")
+            })
+            .count();
+        if healthy_secondaries < usize::from(SUPPORTED_REQUIRED_SECONDARIES) {
+            issues.push(format!(
+                "primary sees {healthy_secondaries} healthy connected secondaries, expected at least {SUPPORTED_REQUIRED_SECONDARIES}"
+            ));
+        }
+    }
 
     match database {
         None => issues.push("managed availability database is absent".to_string()),
@@ -1188,6 +1227,30 @@ fn evaluate_health(
                     if local.local_recovery_lineage.is_none() {
                         issues.push("local database recovery lineage is unavailable".to_string());
                     }
+                }
+            }
+            if matches!(local_role, NativeRole::Primary) {
+                let synchronized_secondaries = database
+                    .replica_states
+                    .iter()
+                    .filter(|state| {
+                        state.scope == EvidenceScope::PrimaryReportedRemote
+                            && state
+                                .synchronization_state
+                                .as_ref()
+                                .map(NativeValue::as_str)
+                                == Some("SYNCHRONIZED")
+                            && state
+                                .synchronization_health
+                                .as_ref()
+                                .map(NativeValue::as_str)
+                                == Some("HEALTHY")
+                    })
+                    .count();
+                if synchronized_secondaries < usize::from(SUPPORTED_REQUIRED_SECONDARIES) {
+                    issues.push(format!(
+                        "primary sees {synchronized_secondaries} synchronized database secondaries, expected at least {SUPPORTED_REQUIRED_SECONDARIES}"
+                    ));
                 }
             }
         }
@@ -1337,6 +1400,34 @@ fn parse_role(
 ) -> Result<NativeRole, RuntimeError> {
     let code = parse_required::<u8>(row, code_column)?;
     let description = required(row, description_column)?;
+    parse_role_values(code, description, description_column)
+}
+
+fn parse_optional_role(
+    row: &TdsRow,
+    code_column: &'static str,
+    description_column: &'static str,
+) -> Result<Option<NativeRole>, RuntimeError> {
+    match (
+        parse_optional::<u8>(row, code_column)?,
+        optional(row, description_column)?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(code), Some(description)) => {
+            parse_role_values(code, description, description_column).map(Some)
+        }
+        _ => Err(malformed(
+            description_column,
+            "numeric and descriptive role values must both be NULL or both be present",
+        )),
+    }
+}
+
+fn parse_role_values(
+    code: u8,
+    description: &str,
+    description_column: &'static str,
+) -> Result<NativeRole, RuntimeError> {
     let expected = match code {
         0 => Some("RESOLVING"),
         1 => Some("PRIMARY"),

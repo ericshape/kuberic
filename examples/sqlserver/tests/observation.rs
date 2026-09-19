@@ -19,6 +19,7 @@ const DATABASE_GUID: &str = "00000015-0000-4000-8000-000000000001";
 const RECOVERY_FORK: &str = "00000016-0000-4000-8000-000000000001";
 const FAMILY_GUID: &str = "00000017-0000-4000-8000-000000000001";
 const FIRST_RECOVERY_FORK: &str = "00000018-0000-4000-8000-000000000001";
+const SEEDING_OPERATION: &str = "00000019-0000-4000-8000-000000000001";
 const MAX_PROGRESS: &str = "9999999999999999999999999";
 
 struct ScriptedExecutor {
@@ -72,6 +73,8 @@ fn capabilities(major: &str, sysadmin: &str) -> TdsResultSet {
         ("can_view_server_performance_state", Some("1")),
         ("can_view_any_definition", Some("1")),
         ("can_alter_any_availability_group", Some(sysadmin)),
+        ("can_alter_target_availability_group", Some(sysadmin)),
+        ("can_control_target_availability_group", Some(sysadmin)),
         ("is_sysadmin", Some(sysadmin)),
     ])]
 }
@@ -211,6 +214,24 @@ fn database_states(local_synchronization_state: &'static str) -> TdsResultSet {
     ]
 }
 
+fn automatic_seeding() -> TdsResultSet {
+    vec![row(&[
+        ("start_time", Some("2026-09-19T20:57:39.000")),
+        ("completion_time", None),
+        ("group_id", Some(GROUP_ID)),
+        ("group_database_id", Some(DATABASE_ID)),
+        ("remote_replica_id", Some(REPLICA_2)),
+        ("operation_id", Some(SEEDING_OPERATION)),
+        ("is_source", Some("1")),
+        ("current_state", Some("1")),
+        ("performed_seeding", Some("0")),
+        ("failure_state", None),
+        ("failure_state_desc", None),
+        ("error_code", None),
+        ("number_of_attempts", Some("1")),
+    ])]
+}
+
 fn healthy_results() -> Vec<TdsResultSet> {
     vec![
         capabilities("16", "0"),
@@ -219,10 +240,46 @@ fn healthy_results() -> Vec<TdsResultSet> {
         replicas(),
         replica_states(),
         database_states("SYNCHRONIZED"),
-        Vec::new(),
+        automatic_seeding(),
         Vec::new(),
         anchor("17"),
     ]
+}
+
+fn disconnected_replica_state(replica_id: &'static str) -> TdsRow {
+    row(&[
+        ("group_id", Some(GROUP_ID)),
+        ("replica_id", Some(replica_id)),
+        ("is_local", Some("0")),
+        ("role", None),
+        ("role_desc", None),
+        ("operational_state_desc", None),
+        ("connected_state_desc", Some("DISCONNECTED")),
+        ("recovery_health_desc", None),
+        ("synchronization_health_desc", Some("NOT_HEALTHY")),
+        ("last_connect_error_number", Some("10060")),
+        (
+            "last_connect_error_description",
+            Some("connection timed out"),
+        ),
+        (
+            "last_connect_error_timestamp",
+            Some("2026-09-19T20:57:42.000"),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn disconnected_remote_role_is_degraded_instead_of_malformed() {
+    let mut results = healthy_results();
+    results[4][1] = disconnected_replica_state(REPLICA_2);
+    results[4][2] = disconnected_replica_state(REPLICA_3);
+    let executor = Arc::new(ScriptedExecutor::new([Ok(results)]));
+
+    let Observation::Present { value, .. } = manager(executor).observe_at(6_500).await else {
+        panic!("expected present observation");
+    };
+    assert_eq!(value.health.status, HealthStatus::Degraded);
 }
 
 fn target() -> ObservationTarget {

@@ -336,7 +336,9 @@ fn classify_driver_error(error: tiberius::error::Error) -> TdsError {
         tiberius::error::Error::Server(server) if server.code() == 18_456 => {
             TdsErrorKind::Authentication
         }
-        tiberius::error::Error::Server(server) if matches!(server.code(), 229 | 230 | 297) => {
+        tiberius::error::Error::Server(server)
+            if matches!(server.code(), 229 | 230 | 297 | 300) =>
+        {
             TdsErrorKind::PermissionDenied
         }
         tiberius::error::Error::Protocol(_)
