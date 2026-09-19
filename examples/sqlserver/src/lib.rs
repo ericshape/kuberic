@@ -1,6 +1,10 @@
 pub mod config;
 pub mod error;
+pub mod instance;
+pub mod monitor;
+pub mod observation;
 pub mod operation;
+pub mod tds;
 pub mod types;
 
 pub use config::{
@@ -9,6 +13,14 @@ pub use config::{
     SUPPORTED_REQUIRED_SECONDARIES, SeedingMode, SqlServerSupportConfig,
 };
 pub use error::ContractError;
+pub use instance::SqlServerInstanceManager;
+pub use monitor::{MonitorState, SqlServerHealthMonitor, SuccessfulSnapshot};
+pub use observation::{
+    AutomaticSeedingSnapshot, AvailabilityDatabaseSnapshot, AvailabilityGroupSnapshot,
+    AvailabilityReplicaSnapshot, DatabaseReplicaStateSnapshot, EvidenceScope, HealthStatus,
+    HealthSummary, NativeValue, ObservationTarget, PhysicalSeedingSnapshot, RecoveryLineageSnapshot,
+    ReplicaStateSnapshot, RuntimeError, ServerCapabilities, SqlServerSnapshot,
+};
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,
     OPERATION_CONTRACT_VERSION, OperationEnvelope, OperationPayload, OperationRecord,
@@ -19,4 +31,8 @@ pub use types::{
     DecimalProgress, Endpoint, Guid, NativeProgress, NativeRole, Observation, ObservationFailure,
     ObservationFailureKind, OpaqueId, PinnedImage, ReplicaDescriptor, ReplicaIdentity, SecretRef,
     ServerName, SqlIdentifier,
+};
+pub use tds::{
+    TdsConnectionConfig, TdsError, TdsErrorKind, TdsExecutor, TdsQuery, TdsQueryKind, TdsResultSet,
+    TdsRow, TiberiusExecutor,
 };

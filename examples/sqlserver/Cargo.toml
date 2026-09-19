@@ -9,4 +9,14 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
+clap.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
+tiberius = { version = "0.12.3", default-features = false, features = ["rustls", "tokio", "tds73"] }
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

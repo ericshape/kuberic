@@ -1,5 +1,7 @@
 use std::num::NonZeroU32;
 
+use serde::Serialize;
+
 use crate::error::ContractError;
 use crate::types::{PinnedImage, SecretRef};
 
@@ -15,7 +17,8 @@ pub const SUPPORTED_REQUIRED_SECONDARIES: u8 = 1;
 /// drifting apart. `supported_profile_constants_agree` asserts that they match.
 pub const SUPPORTED_REPLICA_COUNT_TEXT: &str = "3";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Edition {
     Developer,
     Enterprise,
@@ -23,34 +26,39 @@ pub enum Edition {
     Express,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClusterType {
     External,
     None,
     Wsfc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailoverMode {
     External,
     Manual,
     Automatic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AvailabilityMode {
     SynchronousCommit,
     AsynchronousCommit,
     ConfigurationOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SeedingMode {
     Automatic,
     Manual,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MutationMode {
     ObserveOnly,
     Enabled,
