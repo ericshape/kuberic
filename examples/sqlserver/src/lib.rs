@@ -18,21 +18,22 @@ pub use monitor::{MonitorState, SqlServerHealthMonitor, SuccessfulSnapshot};
 pub use observation::{
     AutomaticSeedingSnapshot, AvailabilityDatabaseSnapshot, AvailabilityGroupSnapshot,
     AvailabilityReplicaSnapshot, DatabaseReplicaStateSnapshot, EvidenceScope, HealthStatus,
-    HealthSummary, NativeValue, ObservationTarget, PhysicalSeedingSnapshot, RecoveryLineageSnapshot,
-    ReplicaStateSnapshot, RuntimeError, ServerCapabilities, SqlServerSnapshot,
+    HealthSummary, NativeValue, ObservationTarget, PhysicalSeedingSnapshot,
+    RecoveryLineageSnapshot, ReplicaStateSnapshot, RuntimeError, ServerCapabilities,
+    SqlServerSnapshot,
 };
 pub use operation::{
     DestructiveApproval, EffectSignature, FenceReference, InputSignature,
     OPERATION_CONTRACT_VERSION, OperationEnvelope, OperationPayload, OperationRecord,
     OperationRequest, ReplayDisposition,
 };
+pub use tds::{
+    TdsConnectionConfig, TdsError, TdsErrorKind, TdsExecutor, TdsQuery, TdsQueryKind, TdsResultSet,
+    TdsRow, TiberiusExecutor,
+};
 pub use types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
     DecimalProgress, Endpoint, Guid, NativeProgress, NativeRole, Observation, ObservationFailure,
     ObservationFailureKind, OpaqueId, PinnedImage, ReplicaDescriptor, ReplicaIdentity, SecretRef,
     ServerName, SqlIdentifier,
-};
-pub use tds::{
-    TdsConnectionConfig, TdsError, TdsErrorKind, TdsExecutor, TdsQuery, TdsQueryKind, TdsResultSet,
-    TdsRow, TiberiusExecutor,
 };

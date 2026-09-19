@@ -417,10 +417,7 @@ pub enum RuntimeError {
     #[error(transparent)]
     Tds(#[from] TdsError),
     #[error("malformed SQL Server observation field {field}: {detail}")]
-    Malformed {
-        field: &'static str,
-        detail: String,
-    },
+    Malformed { field: &'static str, detail: String },
     #[error("unsupported SQL Server capability {field}: expected {expected}, observed {actual}")]
     UnsupportedCapability {
         field: &'static str,
@@ -442,9 +439,7 @@ impl RuntimeError {
                     ObservationFailureKind::PermissionDenied
                 }
                 TdsErrorKind::TimedOut => ObservationFailureKind::TimedOut,
-                TdsErrorKind::Protocol | TdsErrorKind::Query => {
-                    ObservationFailureKind::Malformed
-                }
+                TdsErrorKind::Protocol | TdsErrorKind::Query => ObservationFailureKind::Malformed,
             },
             Self::PermissionDenied(_) => ObservationFailureKind::PermissionDenied,
             Self::UnsupportedCapability { .. } => ObservationFailureKind::Unsupported,
@@ -604,7 +599,33 @@ async fn collect_snapshot(
     }
 
     let database = parse_database(database_rows, &group.identity.group_id, &replicas)?;
-    validate_seeding(&group.identity.group_id, database.as_ref(), &automatic_seeding)?;
+    if let Some(local_database) = database.as_ref().and_then(|database| {
+        database
+            .replica_states
+            .iter()
+            .find(|state| state.scope == EvidenceScope::Local)
+    }) {
+        if local_database.replica_id != anchor_before.local_replica_id {
+            return Err(malformed(
+                "local database replica ID",
+                "database and replica DMVs disagree about local identity",
+            ));
+        }
+        match anchor_before.local_role {
+            NativeRole::Primary if local_database.is_primary_replica != Some(true) => {
+                return Err(RuntimeError::InconsistentSnapshot);
+            }
+            NativeRole::Secondary if local_database.is_primary_replica != Some(false) => {
+                return Err(RuntimeError::InconsistentSnapshot);
+            }
+            _ => {}
+        }
+    }
+    validate_seeding(
+        &group.identity.group_id,
+        database.as_ref(),
+        &automatic_seeding,
+    )?;
 
     let health = evaluate_health(
         anchor_before.local_replica_id.clone(),
@@ -644,16 +665,16 @@ fn parse_capabilities(rows: TdsResultSet) -> Result<ServerCapabilities, RuntimeE
         -2_117_995_310 => Edition::Developer,
         1_804_890_536 | 1_872_460_670 => Edition::Enterprise,
         other => {
-            return Err(unsupported(
-                "edition ID",
-                "Developer or Enterprise",
-                other,
-            ));
+            return Err(unsupported("edition ID", "Developer or Enterprise", other));
         }
     };
     let host_platform = native_required(&row, "host_platform")?;
     if !host_platform.as_str().eq_ignore_ascii_case("linux") {
-        return Err(unsupported("host platform", "Linux", host_platform.as_str()));
+        return Err(unsupported(
+            "host platform",
+            "Linux",
+            host_platform.as_str(),
+        ));
     }
     let is_hadr_enabled = parse_bool_required(&row, "is_hadr_enabled")?;
     if !is_hadr_enabled {
@@ -714,9 +735,7 @@ fn parse_anchor(rows: TdsResultSet) -> Result<Option<ObservationAnchor>, Runtime
     }))
 }
 
-fn parse_group(
-    rows: TdsResultSet,
-) -> Result<Option<AvailabilityGroupSnapshot>, RuntimeError> {
+fn parse_group(rows: TdsResultSet) -> Result<Option<AvailabilityGroupSnapshot>, RuntimeError> {
     let Some(row) = zero_or_one(rows, "availability group")? else {
         return Ok(None);
     };
@@ -773,6 +792,7 @@ fn parse_replicas(rows: TdsResultSet) -> Result<Vec<AvailabilityReplicaSnapshot>
                     format!("{availability_mode_desc} ({availability_mode_code})"),
                 ));
             }
+            let _failover_mode_code = parse_required::<u8>(&row, "failover_mode")?;
             let failover_mode_desc = required(&row, "failover_mode_desc")?;
             if failover_mode_desc != "EXTERNAL" {
                 return Err(unsupported(
@@ -815,10 +835,7 @@ fn parse_replica_states(rows: TdsResultSet) -> Result<Vec<ReplicaStateSnapshot>,
                 operational_state: native_optional(&row, "operational_state_desc")?,
                 connected_state: native_optional(&row, "connected_state_desc")?,
                 recovery_health: native_optional(&row, "recovery_health_desc")?,
-                synchronization_health: native_optional(
-                    &row,
-                    "synchronization_health_desc",
-                )?,
+                synchronization_health: native_optional(&row, "synchronization_health_desc")?,
                 last_connect_error_number: parse_optional(&row, "last_connect_error_number")?,
                 last_connect_error_description: native_optional(
                     &row,
@@ -1012,11 +1029,8 @@ fn parse_physical_seeding(
             Ok(PhysicalSeedingSnapshot {
                 local_seeding_id: parse_guid(&row, "local_seeding_id")?,
                 remote_seeding_id: optional_guid(&row, "remote_seeding_id")?,
-                local_database_name: SqlIdentifier::new(required(
-                    &row,
-                    "local_database_name",
-                )?)
-                .map_err(|error| malformed("local_database_name", error))?,
+                local_database_name: SqlIdentifier::new(required(&row, "local_database_name")?)
+                    .map_err(|error| malformed("local_database_name", error))?,
                 remote_machine_name: native_required(&row, "remote_machine_name")?,
                 role: native_required(&row, "role_desc")?,
                 internal_state: native_required(&row, "internal_state_desc")?,
@@ -1024,10 +1038,7 @@ fn parse_physical_seeding(
                 database_size_bytes: parse_progress(&row, "database_size_bytes")?,
                 start_time_utc: native_optional(&row, "start_time_utc")?,
                 end_time_utc: native_optional(&row, "end_time_utc")?,
-                estimate_time_complete_utc: native_optional(
-                    &row,
-                    "estimate_time_complete_utc",
-                )?,
+                estimate_time_complete_utc: native_optional(&row, "estimate_time_complete_utc")?,
                 failure_code: parse_optional(&row, "failure_code")?,
                 failure_message: native_optional(&row, "failure_message")?,
                 is_compression_enabled: parse_bool_required(&row, "is_compression_enabled")?,
@@ -1170,7 +1181,9 @@ fn evaluate_health(
                         );
                     }
                     if local.is_suspended != Some(false) {
-                        issues.push("local database is suspended or suspension is unknown".to_string());
+                        issues.push(
+                            "local database is suspended or suspension is unknown".to_string(),
+                        );
                     }
                     if local.local_recovery_lineage.is_none() {
                         issues.push("local database recovery lineage is unavailable".to_string());
@@ -1214,10 +1227,7 @@ fn exactly_one(rows: TdsResultSet, field: &'static str) -> Result<TdsRow, Runtim
     Ok(rows.into_iter().next().expect("length checked"))
 }
 
-fn zero_or_one(
-    rows: TdsResultSet,
-    field: &'static str,
-) -> Result<Option<TdsRow>, RuntimeError> {
+fn zero_or_one(rows: TdsResultSet, field: &'static str) -> Result<Option<TdsRow>, RuntimeError> {
     if rows.len() > 1 {
         return Err(malformed(
             field,
@@ -1254,11 +1264,7 @@ where
     T::Err: std::fmt::Display,
 {
     optional(row, column)?
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| malformed(column, error))
-        })
+        .map(|value| value.parse().map_err(|error| malformed(column, error)))
         .transpose()
 }
 
@@ -1266,10 +1272,7 @@ fn parse_bool_required(row: &TdsRow, column: &'static str) -> Result<bool, Runti
     parse_bool(required(row, column)?, column)
 }
 
-fn parse_bool_optional(
-    row: &TdsRow,
-    column: &'static str,
-) -> Result<Option<bool>, RuntimeError> {
+fn parse_bool_optional(row: &TdsRow, column: &'static str) -> Result<Option<bool>, RuntimeError> {
     optional(row, column)?
         .map(|value| parse_bool(value, column))
         .transpose()

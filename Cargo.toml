@@ -50,6 +50,7 @@ serial_test = "4.0.1"
 sha2 = "0.11"
 tokio-postgres = "0.7"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tiberius = { version = "0.12.3", default-features = false, features = ["rustls", "tokio", "tds73"] }
 kube-lease-manager = "0.12.0"
 kube-leader-election = "0.44.0"
 whoami = "2"

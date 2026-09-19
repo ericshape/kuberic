@@ -30,10 +30,7 @@ impl SqlServerInstanceManager {
         check_capabilities(self.executor.as_ref()).await
     }
 
-    pub async fn observe_at(
-        &self,
-        observed_at_unix_millis: u64,
-    ) -> Observation<SqlServerSnapshot> {
+    pub async fn observe_at(&self, observed_at_unix_millis: u64) -> Observation<SqlServerSnapshot> {
         observe(
             self.executor.as_ref(),
             &self.target,

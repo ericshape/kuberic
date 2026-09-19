@@ -125,9 +125,7 @@ impl TdsRow {
     }
 
     pub fn get(&self, column: &str) -> Option<Option<&str>> {
-        self.columns
-            .get(column)
-            .map(|value| value.as_deref())
+        self.columns.get(column).map(|value| value.as_deref())
     }
 }
 
@@ -200,9 +198,7 @@ impl TiberiusExecutor {
         Self { config }
     }
 
-    async fn connect(
-        &self,
-    ) -> Result<Client<tokio_util::compat::Compat<TcpStream>>, TdsError> {
+    async fn connect(&self) -> Result<Client<tokio_util::compat::Compat<TcpStream>>, TdsError> {
         let mut config = Config::new();
         config.host(self.config.endpoint.host());
         config.port(self.config.endpoint.port());
@@ -257,10 +253,7 @@ impl TiberiusExecutor {
         .map_err(|_| {
             TdsError::new(
                 TdsErrorKind::TimedOut,
-                format!(
-                    "timed out negotiating TDS with {}",
-                    self.config.endpoint
-                ),
+                format!("timed out negotiating TDS with {}", self.config.endpoint),
             )
         })?
         .map_err(classify_driver_error)
