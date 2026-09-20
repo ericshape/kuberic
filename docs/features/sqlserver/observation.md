@@ -165,10 +165,11 @@ through a watch channel. The monitor starts with no sample, supports explicit
 cancellation, and reports subscriber loss rather than silently discarding
 results.
 
-Operation-envelope serialization/decoding and the durable result journal
-remain stage 3 work. The existing canonical signatures and approval/fence
-bindings are unchanged. Observation JSON is an output format, not a new
-authenticated command protocol.
+Operation-envelope serialization/decoding and the durable result journal are
+provided by the separate [AG convergence library](convergence.md). Its version
+2 command contract strengthens bootstrap/reseed identity binding. The observer's
+JSON schema remains version 1: it is an output format, not an authenticated
+command protocol, and the observer CLI has no mutation path.
 
 ## Testing
 

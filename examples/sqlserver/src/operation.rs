@@ -12,18 +12,20 @@ use crate::types::{
 
 /// Version of the canonical operation encoding.
 ///
-/// [`OperationRequest::new`] always stamps this value, so the version check in
-/// [`OperationRequest::validate`] is only reachable through
-/// [`OperationRequest::from_decoded_parts`], which is the entry point a decoder
-/// will use once stage 2 of the delivery sequence introduces one.
-pub const OPERATION_CONTRACT_VERSION: u16 = 1;
+/// Version 2 binds bootstrap to a desired primary and destructive reseeding to
+/// the exact old local database. Version 1 is deliberately not upgraded during
+/// decoding: its approvals and fences do not authorize these stronger inputs.
+pub const OPERATION_CONTRACT_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationPayload {
+    /// Canonical v2 order: name, optional group GUID, database name, desired
+    /// primary identity, then the replica set sorted by logical ID/incarnation.
     EnsureAvailabilityGroup {
         name: AvailabilityGroupName,
         expected_group_id: Option<Guid>,
         database_name: SqlIdentifier,
+        primary: ReplicaIdentity,
         replicas: Vec<ReplicaDescriptor>,
     },
     EnsureReplicaJoined {
@@ -36,9 +38,16 @@ pub enum OperationPayload {
         source: ReplicaIdentity,
         target: ReplicaIdentity,
     },
+    /// The old-local identity tuple follows `database` and precedes
+    /// `source`/`target` in canonical v2 encoding. These identities describe
+    /// the database being destroyed, not its intended replacement.
     ReseedReplica {
         availability_group: AvailabilityGroupIdentity,
         database: DatabaseIdentity,
+        /// A local user database ID, never a system database ID (0 through 4).
+        expected_database_id: u32,
+        expected_database_guid: Guid,
+        expected_recovery_fork_id: Guid,
         source: ReplicaIdentity,
         target: ReplicaIdentity,
     },
@@ -96,7 +105,9 @@ impl OperationPayload {
 
     fn validate(&self) -> Result<(), ContractError> {
         match self {
-            Self::EnsureAvailabilityGroup { replicas, .. } => {
+            Self::EnsureAvailabilityGroup {
+                primary, replicas, ..
+            } => {
                 if replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT) {
                     return Err(ContractError::UnsupportedProfile {
                         field: "operation replica count",
@@ -133,6 +144,18 @@ impl OperationPayload {
                         });
                     }
                 }
+                if primary.native_replica_id().is_some() {
+                    return Err(ContractError::UnexpectedNativeIdentity {
+                        field: "bootstrap primary",
+                    });
+                }
+                if !replicas.iter().any(|replica| &replica.identity == primary) {
+                    return Err(ContractError::UnsupportedProfile {
+                        field: "bootstrap primary",
+                        expected: "an exact desired replica member including incarnation",
+                        actual: "not a desired member".to_string(),
+                    });
+                }
             }
             Self::EnsureReplicaSeeded { source, target, .. }
             | Self::ReseedReplica { source, target, .. }
@@ -153,6 +176,19 @@ impl OperationPayload {
                 require_native_replica("join target replica", target)?;
             }
         }
+        if let Self::ReseedReplica {
+            expected_database_id,
+            ..
+        } = self
+        {
+            if *expected_database_id <= 4 {
+                return Err(ContractError::UnsupportedProfile {
+                    field: "reseed expected local database ID",
+                    expected: "a user database ID greater than 4",
+                    actual: expected_database_id.to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -163,6 +199,7 @@ impl OperationPayload {
                 name,
                 expected_group_id,
                 database_name,
+                primary,
                 replicas,
             } => {
                 writer.string(name.as_str());
@@ -170,6 +207,8 @@ impl OperationPayload {
                     writer.string(id.as_str());
                 });
                 writer.string(database_name.as_str());
+                // V2 encodes the desired primary before the sorted member set.
+                writer.replica(primary);
 
                 let mut replicas = replicas.iter().collect::<Vec<_>>();
                 replicas.sort_by(|left, right| {
@@ -204,15 +243,27 @@ impl OperationPayload {
                 database,
                 source,
                 target,
+            } => {
+                writer.availability_group(availability_group);
+                writer.database(database);
+                writer.replica(source);
+                writer.replica(target);
             }
-            | Self::ReseedReplica {
+            Self::ReseedReplica {
                 availability_group,
                 database,
+                expected_database_id,
+                expected_database_guid,
+                expected_recovery_fork_id,
                 source,
                 target,
             } => {
                 writer.availability_group(availability_group);
                 writer.database(database);
+                // V2's old-local identity tuple precedes source and target.
+                writer.u32(*expected_database_id);
+                writer.string(expected_database_guid.as_str());
+                writer.string(expected_recovery_fork_id.as_str());
                 writer.replica(source);
                 writer.replica(target);
             }
@@ -271,6 +322,14 @@ impl DestructiveApproval {
     pub fn authorization_id(&self) -> &str {
         self.authorization_id.as_str()
     }
+
+    pub fn approved_operation_id(&self) -> &str {
+        self.approved_operation_id.as_str()
+    }
+
+    pub fn approved_input_signature(&self) -> InputSignature {
+        self.approved_input_signature
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +349,7 @@ impl FenceReference {
         input_signature: InputSignature,
         fenced_replica: ReplicaIdentity,
     ) -> Result<Self, ContractError> {
+        require_native_replica("fenced replica", &fenced_replica)?;
         Ok(Self {
             provider: OpaqueId::new("fence provider", provider)?,
             receipt_id: OpaqueId::new("fence receipt ID", receipt_id)?,
@@ -305,6 +365,14 @@ impl FenceReference {
 
     pub fn receipt_id(&self) -> &str {
         self.receipt_id.as_str()
+    }
+
+    pub fn operation_id(&self) -> &str {
+        self.operation_id.as_str()
+    }
+
+    pub fn input_signature(&self) -> InputSignature {
+        self.input_signature
     }
 
     pub fn fenced_replica(&self) -> &ReplicaIdentity {
@@ -351,9 +419,8 @@ impl OperationRequest {
     /// Rebuilds a request from previously encoded parts, validating the contract
     /// version before anything else is trusted.
     ///
-    /// This is the seam a decoder plugs into. Until stage 2 of the delivery
-    /// sequence adds one, it exists so that the version check is reachable and
-    /// testable rather than unreachable by construction.
+    /// Decoders must use this validating seam rather than unchecked
+    /// deserialization of the request or its validated native types.
     pub fn from_decoded_parts(
         contract_version: u16,
         resource_id: impl Into<String>,
@@ -363,6 +430,7 @@ impl OperationRequest {
         target_epoch: u64,
         payload: OperationPayload,
     ) -> Result<Self, ContractError> {
+        validate_contract_version(contract_version)?;
         let request = Self {
             contract_version,
             resource_id: OpaqueId::new("resource ID", resource_id)?,
@@ -380,13 +448,7 @@ impl OperationRequest {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
-        if self.contract_version != OPERATION_CONTRACT_VERSION {
-            return Err(ContractError::UnsupportedProfile {
-                field: "operation contract version",
-                expected: "1",
-                actual: self.contract_version.to_string(),
-            });
-        }
+        validate_contract_version(self.contract_version)?;
         if self.target_epoch < self.source_epoch {
             return Err(ContractError::EpochRegression {
                 source: self.source_epoch,
@@ -573,6 +635,12 @@ impl OperationEnvelope {
 pub struct InputSignature([u8; 32]);
 
 impl InputSignature {
+    /// Retains a decoded digest exactly. This is not proof authentication;
+    /// [`OperationEnvelope::new`] checks its binding to the canonical request.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -760,6 +828,17 @@ fn require_native_replica(
 ) -> Result<(), ContractError> {
     if replica.native_replica_id().is_none() {
         return Err(ContractError::MissingNativeIdentity { field });
+    }
+    Ok(())
+}
+
+fn validate_contract_version(version: u16) -> Result<(), ContractError> {
+    if version != OPERATION_CONTRACT_VERSION {
+        return Err(ContractError::UnsupportedProfile {
+            field: "operation contract version",
+            expected: "2",
+            actual: version.to_string(),
+        });
     }
     Ok(())
 }

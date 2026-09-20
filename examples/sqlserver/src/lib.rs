@@ -1,8 +1,13 @@
+pub mod adapter;
+pub mod codec;
 pub mod config;
+pub mod convergence;
 pub mod error;
 pub mod executor;
 pub mod instance;
+pub mod journal;
 pub mod monitor;
+pub mod mutation;
 pub mod observation;
 pub mod operation;
 pub mod query;

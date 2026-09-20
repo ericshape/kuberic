@@ -29,54 +29,85 @@ impl TdsExecutor {
     }
 }
 
-struct TdsSession {
-    client: Client<Compat<TcpStream>>,
+pub(crate) struct TdsSession {
+    pub(crate) client: Client<Compat<TcpStream>>,
     query_timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TdsPurpose {
+    Observer,
+    Mutation,
 }
 
 #[async_trait]
 impl SqlExecutor for TdsExecutor {
     async fn connect(&self) -> Result<Box<dyn SqlSession>, RuntimeError> {
-        timeout(self.settings.connect_timeout, async {
-            let username = read_secret(&self.settings.username_file, "observer username").await?;
-            let password = read_secret(&self.settings.password_file, "observer password").await?;
-            let config = connection_config(&self.settings, &username, &password);
-            let tcp =
-                TcpStream::connect((self.settings.endpoint.host(), self.settings.endpoint.port()))
-                    .await
-                    .map_err(|_| {
-                        RuntimeError::new(
-                            ObservationFailureKind::Unreachable,
-                            "TCP connect",
-                            "cannot reach the configured SQL Server endpoint",
-                        )
-                    })?;
-            tcp.set_nodelay(true).map_err(|_| {
-                RuntimeError::new(
-                    ObservationFailureKind::Unreachable,
-                    "TCP connect",
-                    "cannot configure the SQL Server connection",
-                )
-            })?;
-            let client = Client::connect(config, tcp.compat_write())
-                .await
-                .map_err(|error| driver_error("TLS/TDS login", error))?;
-            Ok(Box::new(TdsSession {
-                client,
-                query_timeout: self.settings.query_timeout,
-            }) as Box<dyn SqlSession>)
-        })
-        .await
-        .map_err(|_| timed_out("TLS/TDS connect"))?
+        Ok(Box::new(
+            connect_session(&self.settings, TdsPurpose::Observer).await?,
+        ))
     }
 }
 
-fn connection_config(settings: &ConnectionSettings, username: &str, password: &str) -> Config {
+pub(crate) async fn connect_session(
+    settings: &ConnectionSettings,
+    purpose: TdsPurpose,
+) -> Result<TdsSession, RuntimeError> {
+    timeout(settings.connect_timeout, async {
+        let (username_stage, password_stage, application_name) = match purpose {
+            TdsPurpose::Observer => (
+                "observer username",
+                "observer password",
+                "kuberic-sqlserver-observer",
+            ),
+            TdsPurpose::Mutation => (
+                "mutation username",
+                "mutation password",
+                "kuberic-sqlserver-ag-adapter",
+            ),
+        };
+        let username = read_secret(&settings.username_file, username_stage).await?;
+        let password = read_secret(&settings.password_file, password_stage).await?;
+        let config = connection_config(settings, &username, &password, application_name);
+        let tcp = TcpStream::connect((settings.endpoint.host(), settings.endpoint.port()))
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    ObservationFailureKind::Unreachable,
+                    "TCP connect",
+                    "cannot reach the configured SQL Server endpoint",
+                )
+            })?;
+        tcp.set_nodelay(true).map_err(|_| {
+            RuntimeError::new(
+                ObservationFailureKind::Unreachable,
+                "TCP connect",
+                "cannot configure the SQL Server connection",
+            )
+        })?;
+        let client = Client::connect(config, tcp.compat_write())
+            .await
+            .map_err(|error| driver_error("TLS/TDS login", error))?;
+        Ok(TdsSession {
+            client,
+            query_timeout: settings.query_timeout,
+        })
+    })
+    .await
+    .map_err(|_| timed_out("TLS/TDS connect"))?
+}
+
+fn connection_config(
+    settings: &ConnectionSettings,
+    username: &str,
+    password: &str,
+    application_name: &'static str,
+) -> Config {
     let mut config = Config::new();
     config.host(settings.endpoint.host());
     config.port(settings.endpoint.port());
     config.database("master");
-    config.application_name("kuberic-sqlserver-observer");
+    config.application_name(application_name);
     config.encryption(EncryptionLevel::Required);
     if let Some(path) = &settings.ca_certificate_file {
         // Config validation rejects non-UTF-8 paths before this point.
@@ -95,54 +126,66 @@ impl SqlSession for TdsSession {
         query: ReadQuery,
         availability_group: &AvailabilityGroupName,
     ) -> Result<Vec<QueryRow>, RuntimeError> {
+        self.query_text(
+            query.sql(),
+            availability_group.as_str(),
+            query.columns(),
+            query.label(),
+        )
+        .await
+    }
+}
+
+impl TdsSession {
+    pub(crate) async fn query_text(
+        &mut self,
+        sql: &str,
+        parameter: &str,
+        columns: &[&str],
+        stage: &'static str,
+    ) -> Result<Vec<QueryRow>, RuntimeError> {
         timeout(self.query_timeout, async {
-            let name = availability_group.as_str();
+            let name = parameter;
             let mut stream = self
                 .client
-                .query(query.sql(), &[&name])
+                .query(sql, &[&name])
                 .await
-                .map_err(|error| driver_error(query.label(), error))?;
+                .map_err(|error| driver_error(stage, error))?;
             let mut rows = Vec::new();
             let mut result_sets = 0;
             while let Some(item) = stream
                 .try_next()
                 .await
-                .map_err(|error| driver_error(query.label(), error))?
+                .map_err(|error| driver_error(stage, error))?
             {
                 match item {
                     QueryItem::Metadata(metadata) => {
                         result_sets += 1;
                         if result_sets != 1 {
-                            return Err(malformed(
-                                query.label(),
-                                "unexpected multiple result sets",
-                            ));
+                            return Err(malformed(stage, "unexpected multiple result sets"));
                         }
-                        validate_columns(query, metadata.columns())?;
+                        validate_result_columns(columns, metadata.columns(), stage)?;
                     }
                     QueryItem::Row(row) => {
                         if rows.len() == MAX_QUERY_ROWS {
                             return Err(malformed(
-                                query.label(),
+                                stage,
                                 "query exceeds the 4096-row observation limit",
                             ));
                         }
                         let mut values = QueryRow::new();
                         for (index, column) in row.columns().iter().enumerate() {
                             let value = row.try_get::<&str, _>(index).map_err(|_| {
-                                malformed(query.label(), "expected a text or NULL DMV column")
+                                malformed(stage, "expected a text or NULL DMV column")
                             })?;
                             if value.is_some_and(|text| text.len() > MAX_CELL_BYTES) {
-                                return Err(malformed(
-                                    query.label(),
-                                    "DMV column exceeds the size limit",
-                                ));
+                                return Err(malformed(stage, "DMV column exceeds the size limit"));
                             }
                             if values
                                 .insert(column.name().to_owned(), value.map(str::to_owned))
                                 .is_some()
                             {
-                                return Err(malformed(query.label(), "duplicate DMV column name"));
+                                return Err(malformed(stage, "duplicate DMV column name"));
                             }
                         }
                         rows.push(values);
@@ -150,33 +193,40 @@ impl SqlSession for TdsSession {
                 }
             }
             if result_sets != 1 {
-                return Err(malformed(query.label(), "missing DMV result set"));
+                return Err(malformed(stage, "missing DMV result set"));
             }
             Ok(rows)
         })
         .await
-        .map_err(|_| timed_out(query.label()))?
+        .map_err(|_| timed_out(stage))?
     }
 }
 
-fn validate_columns(query: ReadQuery, columns: &[Column]) -> Result<(), RuntimeError> {
-    if columns.len() != query.columns().len()
+fn validate_result_columns(
+    expected_columns: &[&str],
+    columns: &[Column],
+    stage: &'static str,
+) -> Result<(), RuntimeError> {
+    if columns.len() != expected_columns.len()
         || columns
             .iter()
-            .zip(query.columns())
+            .zip(expected_columns)
             .any(|(actual, expected)| {
                 actual.name() != *expected || actual.column_type() != ColumnType::NVarchar
             })
     {
         return Err(malformed(
-            query.label(),
+            stage,
             "DMV result schema does not match the predefined query",
         ));
     }
     Ok(())
 }
 
-async fn read_secret(path: &Path, stage: &'static str) -> Result<Zeroizing<String>, RuntimeError> {
+pub(crate) async fn read_secret(
+    path: &Path,
+    stage: &'static str,
+) -> Result<Zeroizing<String>, RuntimeError> {
     let bytes = Zeroizing::new(read_bounded(path, MAX_SECRET_BYTES, stage).await?);
     let text =
         std::str::from_utf8(&bytes).map_err(|_| malformed(stage, "Secret must be UTF-8 text"))?;
@@ -189,7 +239,7 @@ async fn read_secret(path: &Path, stage: &'static str) -> Result<Zeroizing<Strin
     Ok(Zeroizing::new(text.to_owned()))
 }
 
-fn driver_error(stage: &'static str, error: tiberius::error::Error) -> RuntimeError {
+pub(crate) fn driver_error(stage: &'static str, error: tiberius::error::Error) -> RuntimeError {
     use tiberius::error::Error;
 
     let code = error.code();
@@ -307,6 +357,9 @@ mod tests {
     #[test]
     fn result_metadata_is_validated_even_when_no_rows_are_returned() {
         for query in ReadQuery::ALL {
+            let validate_columns = |query: ReadQuery, columns: &[Column]| {
+                validate_result_columns(query.columns(), columns, query.label())
+            };
             let expected: Vec<Column> = query
                 .columns()
                 .iter()
