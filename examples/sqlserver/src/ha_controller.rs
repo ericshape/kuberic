@@ -362,6 +362,13 @@ impl<B: HaBackend, F: FenceProvider> HaController<B, F> {
         } else {
             let nodes = self.backend.observe(request, context, &self.policy).await?;
             preflight(request, context, &nodes, &self.policy)?;
+            self.verifier.verify(
+                authority_proof,
+                &scope,
+                ProofKind::Authority,
+                unix_millis()?,
+            )?;
+            verify_loss_approval(&self.verifier, request, &scope, approval, unix_millis()?)?;
             state.pending = Some(PendingTransition {
                 scope: scope.clone(),
                 target_authority: ActiveAuthority {

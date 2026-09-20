@@ -524,19 +524,10 @@ fn decide(
     if !offline_ack {
         return Ok(HaDecision::Execute(offline));
     }
-    if !start_ack {
-        return if witness_resolving {
-            Ok(HaDecision::Execute(start))
-        } else {
-            Err(Blocked::Wait(
-                "secondary OFFLINE acknowledged; waiting for native RESOLVING",
-            ))
-        };
-    }
-    if witness_resolving {
-        return Err(Blocked::Wait(
-            "secondary restart acknowledged; waiting for native SECONDARY",
-        ));
+    if !start_ack || witness_resolving {
+        // Start is guarded and idempotent. Its reply may be lost, or an earlier
+        // OFFLINE may finish after a no-op start observed SECONDARY.
+        return Ok(HaDecision::Execute(start));
     }
     let target_db = local_database(target_node, target_group, now, policy)?;
     let witness_db = local_database(witness_node, witness_group, now, policy)?;

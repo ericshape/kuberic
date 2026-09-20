@@ -159,6 +159,10 @@ During a transition, a provisional target lease is bounded by the transition
 proofs and requires a fresh surviving quorum. A prepared promotion alone is not
 completion. The controller observes the new primary, restores the surviving
 secondary, renews the target lease, and atomically installs the target epoch.
+Secondary-start retries are idempotent: a lost start reply or delayed OFFLINE
+completion cannot strand the controller waiting for a state that already changed.
+Proof lifetimes are rechecked after observation and before freezing authority,
+so an expired request cannot disable the existing primary's lease renewal.
 Exact completed retries return historical results rather than fresh write
 authority.
 

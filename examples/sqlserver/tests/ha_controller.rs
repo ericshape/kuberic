@@ -28,6 +28,9 @@ struct Model {
     removed: bool,
     fail_inventory: bool,
     lose_promotion_reply: bool,
+    lose_start_reply: bool,
+    delayed_offline: bool,
+    observation_delay_ms: u64,
     effects: Vec<String>,
     renewals: usize,
 }
@@ -71,6 +74,10 @@ impl HaBackend for Backend {
         _: &AvailabilityGroupIdentity,
         _: &HaPolicy,
     ) -> Result<Vec<HaNode>, RuntimeError> {
+        let delay = self.0.lock().unwrap().observation_delay_ms;
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         let mut nodes = self.0.lock().unwrap().nodes.clone();
         let now = unix_millis()?;
         for node in &mut nodes {
@@ -150,6 +157,9 @@ impl HaBackend for Backend {
                 }
             }
             HaAction::OfflineSecondary { .. } => {
+                if model.delayed_offline {
+                    return Ok(());
+                }
                 set_role(&mut model.nodes[2], NativeRole::Resolving);
                 model.nodes[2].node.database = Observation::Failed(
                     fail(ObservationFailureKind::Unsupported).into_failure(unix_millis()?),
@@ -159,6 +169,11 @@ impl HaBackend for Backend {
                 group.databases[0].replicas.clear();
             }
             HaAction::StartSecondary { .. } => {
+                if model.delayed_offline {
+                    model.delayed_offline = false;
+                    set_role(&mut model.nodes[2], NativeRole::Resolving);
+                    return Ok(());
+                }
                 set_role(&mut model.nodes[2], NativeRole::Secondary);
                 let fork = fixtures::database_probe(&mut model.nodes[1].node)
                     .recovery_fork_id
@@ -166,6 +181,10 @@ impl HaBackend for Backend {
                 let mut follower = fixtures::probe(3, true);
                 follower.recovery_fork_id = fork;
                 fixtures::install_database(&mut model.nodes[2].node, 3, Some(follower));
+                if model.lose_start_reply {
+                    model.lose_start_reply = false;
+                    return Err(fail(ObservationFailureKind::TimedOut));
+                }
             }
         }
         Ok(())
@@ -335,6 +354,9 @@ fn setup() -> (HaContext, Arc<Mutex<Model>>, OperationEnvelope) {
             removed: false,
             fail_inventory: false,
             lose_promotion_reply: false,
+            lose_start_reply: false,
+            delayed_offline: false,
+            observation_delay_ms: 0,
             effects: Vec::new(),
             renewals: 0,
         })),
@@ -393,8 +415,27 @@ fn transition(context: &HaContext, model: &Model, forced: bool) -> OperationRequ
 
 #[tokio::test]
 async fn signed_switch_fences_then_recovers_a_lost_promotion_reply_and_commits_authority() {
+    switch_recovery(true, false, false).await;
+}
+
+#[tokio::test]
+async fn lost_secondary_start_reply_is_recovered_after_controller_restart() {
+    switch_recovery(false, true, false).await;
+}
+
+#[tokio::test]
+async fn asynchronous_offline_completion_cannot_make_a_start_ack_terminal() {
+    switch_recovery(false, false, true).await;
+}
+
+async fn switch_recovery(lost_promotion: bool, lost_start: bool, delayed_offline: bool) {
     let (context, state, adopt) = setup();
-    state.lock().unwrap().lose_promotion_reply = true;
+    {
+        let mut model = state.lock().unwrap();
+        model.lose_promotion_reply = lost_promotion;
+        model.lose_start_reply = lost_start;
+        model.delayed_offline = delayed_offline;
+    }
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("journal");
     let (keys, issuers, verifier) = key_material();
@@ -455,7 +496,7 @@ async fn signed_switch_fences_then_recovers_a_lost_promotion_reply_and_commits_a
     assert!(oracle.check(&old_scope, &ProofClaim::Authority).is_err());
     assert!(state.lock().unwrap().removed);
     let mut complete = false;
-    for _ in 0..15 {
+    for _ in 0..20 {
         match controller
             .reconcile(&command.envelope, &context, &command.proofs)
             .await
@@ -681,5 +722,88 @@ fn signed_adoption(keys: &Keys, context: &HaContext, request: &OperationEnvelope
         ),
         approval: None,
         fence: None,
+    }
+}
+
+#[tokio::test]
+async fn proof_expiry_during_observation_never_freezes_existing_authority() {
+    for expired_approval in [false, true] {
+        let (context, state, adopt) = setup();
+        let directory = tempfile::tempdir().unwrap();
+        let (keys, issuers, verifier) = key_material();
+        let policy = HaPolicy::default();
+        let mut controller = HaController::new(
+            OperationJournal::open(
+                &directory.path().join("journal"),
+                context.source.resource_id.as_str(),
+            )
+            .unwrap(),
+            Backend(state.clone()),
+            Fencer(state.clone()),
+            verifier,
+            issuers,
+            policy.clone(),
+        )
+        .unwrap()
+        .with_mode(MutationMode::Enabled);
+        controller
+            .adopt(
+                &adopt,
+                &context.source,
+                &signed_adoption(&keys, &context, &adopt),
+            )
+            .await
+            .unwrap();
+        let request = transition(&context, &state.lock().unwrap(), expired_approval);
+        let scope = ProofScope::for_operation(&request, policy_binding(&context, &policy));
+        let now = unix_millis().unwrap();
+        let expiring = |key: &ProofSigner, claim: ProofClaim| {
+            key.sign(ProofClaims {
+                version: 1,
+                proof_id: "short-lived-proof".into(),
+                issuer_id: key.issuer_id().into(),
+                issued_at_unix_millis: now,
+                not_before_unix_millis: now,
+                expires_at_unix_millis: now + 300,
+                scope: scope.clone(),
+                claim,
+            })
+            .unwrap()
+        };
+        let authority = if expired_approval {
+            sign(
+                &keys.authority,
+                &request,
+                scope.authority_binding,
+                ProofClaim::Authority,
+            )
+        } else {
+            expiring(&keys.authority, ProofClaim::Authority)
+        };
+        let approval = expired_approval.then(|| {
+            expiring(
+                &keys.approval,
+                ProofClaim::Approval {
+                    allow_data_loss: true,
+                    allow_unknown_data_loss: true,
+                },
+            )
+        });
+        let before = controller.journal().checkpoint("ha-control").unwrap();
+        state.lock().unwrap().observation_delay_ms = 600;
+        assert!(
+            controller
+                .prepare_fence(&request, &context, &authority, approval.as_ref())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            controller.journal().checkpoint("ha-control").unwrap(),
+            before
+        );
+        assert!(state.lock().unwrap().effects.is_empty());
+        assert!(!state.lock().unwrap().removed);
+        state.lock().unwrap().observation_delay_ms = 0;
+        controller.renew_primary(&context.source).await.unwrap();
     }
 }

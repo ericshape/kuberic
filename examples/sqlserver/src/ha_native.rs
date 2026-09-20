@@ -658,6 +658,9 @@ fn database_observation(
     observation: &Observation<crate::observation::InstanceSnapshot>,
     name: &crate::SqlIdentifier,
 ) -> Observation<DatabaseProbe> {
+    if let Observation::Failed(failure) = observation {
+        return Observation::Failed(failure.clone());
+    }
     let at = observation.observed_at_unix_millis();
     let failure = || {
         Observation::Failed(
@@ -1026,5 +1029,20 @@ mod tests {
             Some("-1".into()),
         );
         assert!(parse_health(&[row], &native_group, "sql-1").is_err());
+    }
+
+    #[test]
+    fn removed_source_database_projection_preserves_connectivity_failure() {
+        for kind in [
+            ObservationFailureKind::Unreachable,
+            ObservationFailureKind::TimedOut,
+        ] {
+            let failed = error(kind, "source connection unavailable").into_failure(123);
+            let instance = Observation::Failed(failed.clone());
+            assert_eq!(
+                database_observation(&instance, &crate::SqlIdentifier::new("database").unwrap()),
+                Observation::Failed(failed)
+            );
+        }
     }
 }

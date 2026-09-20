@@ -874,7 +874,7 @@ fn post_promotion_offline_resolving_start_secondary_and_sync_are_observed_in_ord
     let mut keys = BTreeSet::from(["promote".into()]);
     assert_eq!(action(decide(&evidence, &keys, true)), offline());
     keys.insert(offline().key());
-    refuse(decide(&evidence, &keys, true));
+    assert_eq!(action(decide(&evidence, &keys, true)), start());
     role(&mut evidence[2], NativeRole::Resolving);
     evidence[2].node.database = Observation::Absent {
         observed_at_unix_millis: AT,
@@ -883,7 +883,7 @@ fn post_promotion_offline_resolving_start_secondary_and_sync_are_observed_in_ord
     group(&mut evidence[2].node).databases[0].replicas.clear();
     assert_eq!(action(decide(&evidence, &keys, true)), start());
     keys.insert(start().key());
-    refuse(decide(&evidence, &keys, true));
+    assert_eq!(action(decide(&evidence, &keys, true)), start());
     let local = probe(3, true);
     install_database(&mut evidence[2].node, 3, Some(local));
     role(&mut evidence[2], NativeRole::Secondary);
@@ -969,7 +969,7 @@ fn resolving_reset_can_start_with_unavailable_probes_and_partial_recovery_metada
         // a role reset nor its ACK is a claim that either database is ready.
         evidence[1].node.database = failure(ObservationFailureKind::Unsupported);
         assert_eq!(action(decide(&evidence, &keys, true)), start());
-        refuse(decide(&evidence, &completed_keys(), true));
+        assert_eq!(action(decide(&evidence, &completed_keys(), true)), start());
         role(&mut evidence[2], NativeRole::Secondary);
         refuse(decide(&evidence, &completed_keys(), true));
         evidence[2] = nodes()[2].clone();
@@ -1104,6 +1104,69 @@ fn request_rejects_skipped_or_wrapped_epochs_before_planning() {
             )
             .is_err()
         );
+    }
+}
+
+#[test]
+fn distinct_restored_local_guids_preserve_shared_ag_identity_and_terminal_fork_checks() {
+    let mut evidence = nodes();
+    // A retained pre-fence source sample is not a vote or post-removal presence.
+    evidence[0].node = existing(1, true);
+    let before_fence = FENCED - 1;
+    stamp(&mut evidence[0].node.instance, before_fence);
+    stamp(&mut evidence[0].node.database, before_fence);
+    snapshot(&mut evidence[0].node).observed_at_unix_millis = before_fence;
+    stamp(
+        &mut snapshot(&mut evidence[0].node).availability_group,
+        before_fence,
+    );
+    group(&mut evidence[0].node).databases[0].replicas[0]
+        .progress
+        .committed_record = Some(progress(400));
+    let guids: Vec<_> = evidence
+        .iter_mut()
+        .map(|node| database_probe(&mut node.node).database_guid.clone())
+        .collect();
+    assert_eq!(guids, [guid(201), guid(202), guid(203)]);
+    assert!(matches!(
+        action(decide(&evidence, &BTreeSet::new(), false)),
+        HaAction::Promote { forced: false, .. }
+    ));
+    assert!(matches!(
+        action(plan(
+            &operation(true),
+            &context(),
+            &evidence,
+            &fence(),
+            &BTreeSet::new(),
+            false,
+            NOW,
+            &HaPolicy::default()
+        )),
+        HaAction::Promote { forced: true, .. }
+    ));
+    role(&mut evidence[1], NativeRole::Primary);
+    let HaDecision::Complete(result) = decide(&evidence, &completed_keys(), true) else {
+        panic!("local physical GUID differences must not prevent AG completion");
+    };
+    assert_eq!(result.database_guid, guid(202));
+    assert_eq!(
+        result.database.database.group_database_id,
+        database().group_database_id
+    );
+    assert_eq!(result.database.recovery_fork_id, guid(300));
+
+    let contradictions: &[fn(&mut HaNode)] = &[
+        |n| group(&mut n.node).databases[0].identity.group_database_id = guid(999),
+        |n| database_probe(&mut n.node).group_database_id = Some(guid(999)),
+        |n| group(&mut n.node).databases[0].replicas[0].group_database_id = guid(999),
+        |n| fork(n, 301),
+        |n| database_probe(&mut n.node).database_guid = guid(999),
+    ];
+    for contradiction in contradictions {
+        let mut changed = evidence.clone();
+        contradiction(&mut changed[2]);
+        unsafe_decision(decide(&changed, &completed_keys(), true));
     }
 }
 
