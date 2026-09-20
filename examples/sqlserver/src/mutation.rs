@@ -514,10 +514,10 @@ pub(crate) fn validate_action(
         (
             OperationPayload::EnsureAvailabilityGroup {
                 name,
+                expected_group_id,
                 database_name,
                 primary,
                 replicas,
-                ..
             },
             NativeAction::CreateAvailabilityGroup {
                 name: actual_name,
@@ -528,7 +528,9 @@ pub(crate) fn validate_action(
                 ..
             },
         ) => {
-            name == actual_name
+            // CREATE allocates a new GUID; it cannot satisfy an existing-GUID binding.
+            expected_group_id.is_none()
+                && name == actual_name
                 && database_name == actual_database
                 && primary == actual_primary
                 && *expected_database_id > 4
@@ -1260,6 +1262,83 @@ mod tests {
         )
         .unwrap();
         assert!(validate_action(&join, &authority(), &drop_action()).is_err());
+    }
+
+    #[tokio::test]
+    async fn public_backend_cannot_create_a_new_guid_for_an_expected_existing_group() {
+        struct NoSideEffects;
+        #[async_trait]
+        impl AuthorizationVerifier for NoSideEffects {
+            async fn verify_request(
+                &self,
+                _: &OperationEnvelope,
+                _: &AcceptedAuthority,
+            ) -> Result<(), RuntimeError> {
+                panic!("native binding rejection must precede authorization and connection");
+            }
+            async fn verify(
+                &self,
+                _: &OperationEnvelope,
+                _: &AcceptedAuthority,
+                _: &NativeAction,
+            ) -> Result<(), RuntimeError> {
+                panic!("native binding rejection must precede SQL dispatch");
+            }
+        }
+        let authority = authority();
+        let envelope = OperationEnvelope::new(
+            OperationRequest::new(
+                "resource",
+                "existing-group",
+                "configuration",
+                1,
+                1,
+                OperationPayload::EnsureAvailabilityGroup {
+                    name: group().name,
+                    expected_group_id: Some(guid(55)),
+                    database_name: database().name,
+                    primary: authority.primary.clone(),
+                    replicas: authority.replicas.clone(),
+                },
+            )
+            .unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let action = NativeAction::CreateAvailabilityGroup {
+            primary: authority.primary.clone(),
+            name: group().name,
+            database_name: database().name,
+            replicas: authority.replicas.clone(),
+            expected_database_id: 5,
+            expected_database_guid: guid(3),
+            expected_recovery_fork_id: guid(4),
+        };
+        let nodes = authority
+            .replicas
+            .iter()
+            .map(|member| {
+                let config = serde_json::json!({
+                    "host": member.endpoint.host(),
+                    "availability_group": "group",
+                    "expected_server_name": member.server_name.as_str(),
+                    "replica_id": member.identity.logical_id(),
+                    "incarnation": member.identity.incarnation(),
+                    "observer_username_file": "/not-provisioned/observer/username",
+                    "observer_password_file": "/not-provisioned/observer/password"
+                });
+                let observer =
+                    ObserverConfig::from_json(&serde_json::to_vec(&config).unwrap()).unwrap();
+                MutationEndpoint::observe_only(observer, member.endpoint.clone())
+            })
+            .collect();
+        let backend = TdsAgBackend::new(nodes, database().name).unwrap();
+        let error = backend
+            .execute(&envelope, &authority, &action, &NoSideEffects)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ObservationFailureKind::Inconsistent);
     }
 
     #[test]
