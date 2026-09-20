@@ -141,6 +141,10 @@ impl<B, V> AgAdapter<B, V> {
     pub fn journal(&self) -> &OperationJournal {
         &self.journal
     }
+
+    pub fn into_journal(self) -> OperationJournal {
+        self.journal
+    }
 }
 
 impl<B: AgBackend, V: AuthorizationVerifier> AgAdapter<B, V> {
@@ -457,6 +461,7 @@ fn bootstrap_intent_matches(
         database_name,
         primary,
         replicas,
+        write_lease_seconds,
         ..
     } = envelope.request().payload()
     else {
@@ -483,6 +488,7 @@ fn bootstrap_intent_matches(
         expected_database_id: database.database_id,
         expected_database_guid: database.database_guid.clone(),
         expected_recovery_fork_id: database.recovery_fork_id.clone(),
+        write_lease_seconds: *write_lease_seconds,
     });
     let encoded = encode_action(&action)?;
     Ok(entry

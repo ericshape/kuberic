@@ -18,7 +18,8 @@ use crate::operation::{
 };
 use crate::types::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
-    DecimalProgress, Endpoint, Guid, ReplicaDescriptor, ReplicaIdentity, ServerName, SqlIdentifier,
+    DecimalProgress, Endpoint, Guid, OpaqueId, ReplicaDescriptor, ReplicaIdentity, ServerName,
+    SqlIdentifier,
 };
 
 pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
@@ -77,8 +78,8 @@ pub fn encode_envelope(envelope: &OperationEnvelope) -> Result<Vec<u8>, CodecErr
     Ok(bytes)
 }
 
-/// Decodes through validated constructors and rejects v1 rather than inventing
-/// the primary/old-database authority absent from that contract.
+/// Decodes through validated constructors and rejects v1/v2 rather than
+/// inventing the write lease or target configuration absent from those contracts.
 ///
 /// Replica member sets are returned in canonical order. JSON object order and
 /// insignificant whitespace are not significant; duplicate/unknown fields,
@@ -235,6 +236,7 @@ fn decode_request(bytes: &[u8]) -> Result<OperationRequest, CodecError> {
             let expected_group_id = reader.optional(|reader| reader.guid())?;
             let database_name =
                 SqlIdentifier::new(reader.string()?).map_err(|_| CodecError::InvalidField)?;
+            let write_lease_seconds = reader.u32()?;
             let primary = reader.replica()?;
             // Do not allocate from an untrusted member-count prefix.
             if reader.u32()? != u32::from(SUPPORTED_REPLICA_COUNT) {
@@ -254,6 +256,7 @@ fn decode_request(bytes: &[u8]) -> Result<OperationRequest, CodecError> {
                 name,
                 expected_group_id,
                 database_name,
+                write_lease_seconds,
                 primary,
                 replicas,
             }
@@ -282,6 +285,8 @@ fn decode_request(bytes: &[u8]) -> Result<OperationRequest, CodecError> {
             database: reader.lineage()?,
             source: reader.replica()?,
             target: reader.replica()?,
+            target_configuration_id: OpaqueId::new("target configuration ID", reader.string()?)
+                .map_err(|_| CodecError::InvalidField)?,
             commit_boundary: reader.progress()?,
         },
         6 => OperationPayload::ForcedFailover {
@@ -289,6 +294,8 @@ fn decode_request(bytes: &[u8]) -> Result<OperationRequest, CodecError> {
             database: reader.lineage()?,
             source: reader.replica()?,
             target: reader.replica()?,
+            target_configuration_id: OpaqueId::new("target configuration ID", reader.string()?)
+                .map_err(|_| CodecError::InvalidField)?,
             last_known_commit: reader.optional(|reader| reader.progress())?,
         },
         _ => return Err(CodecError::UnknownTag),

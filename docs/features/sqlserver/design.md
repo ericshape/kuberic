@@ -1,8 +1,9 @@
 # SQL Server External-Replication Adapter
 
 > **Status:** Safety contract, observation runtime, and gated AG convergence
-> library. Observe-only remains the default. SQL Server process supervision,
-> write-lease management, failover, and operator integration are not provided.
+> library, with an explicitly driven HA controller and owned-container fencing.
+> Observe-only remains the default. Automatic target election, general SQL
+> Server process supervision, and operator integration are not provided.
 >
 > **Support level:** Experimental. This is not a Microsoft-supported Kubernetes
 > high-availability solution.
@@ -70,41 +71,45 @@ observe-only runtime, and a separately authorized convergence library:
 - verified-TLS TDS execution with mounted observation credentials;
 - capability-checked, identity-bracketed native DMV snapshots; and
 - a freshness-aware monitor and observe-only JSON CLI;
-- a validated version 2 operation-envelope codec and durable result journal;
+- a validated version 3 operation-envelope codec and durable result journal;
 - pure bootstrap/join/seeding/reseed decisions; and
-- guarded, single-effect TDS mutations behind an injected authorization boundary.
+- guarded, single-effect TDS mutations behind an injected authorization boundary;
+- authenticated, expiring Ed25519 authority/approval/fence/lease proofs; and
+- explicit native HA transitions, write-lease maintenance, and an owned
+  three-container laboratory.
 
 The crate connects to already provisioned SQL Server instances. Its library can
 create/join AGs and request automatic seeding; exact-target reseed additionally
 requires independently verified destructive approval and fencing. Enabling
 mutation mode alone is insufficient: the shipped verifier denies mutations.
-The observer CLI cannot mutate. No write lease, promotion, demotion, switchover,
-failover, or operator integration is implemented.
+The observer CLI cannot mutate. The separate HA controller implements explicit
+switchover/forced failover and native write leases behind signature, current
+authority, configuration quorum, health, and permanent-fence gates. No automatic
+Kubernetes failover or operator integration is claimed.
 
 The crate has no dependency on `kuberic-core`. The `sqlserver-observer` binary
 and runtime remain independently testable without the replication runtime.
 See the [observe-only runtime guide](observation.md) for configuration,
 permissions, output semantics, and tests, and the
-[AG convergence guide](convergence.md) for command/journal and authorization
-boundaries.
+[AG convergence guide](convergence.md) for command/journal boundaries and the
+[HA guide](ha.md) for native protocol, authorization, fencing, and live-test
+limitations.
 
 Command transport and proof authentication remain separate capabilities:
 
 - **Encoding and decoding.** Stage 3 implements a bounded, validating codec and
-  durable journal. Contract version 2 binds bootstrap to an explicit primary
-  and reseed to the exact old local database identity. Version 1 requests are
-  rejected, not silently upgraded; their approvals must be reissued for new
-  canonical inputs. Observation JSON is separate from command encoding.
+  durable journal. Version 2 introduced explicit bootstrap-primary and old-local
+  reseed identity binding. Version 3 additionally binds bootstrap lease duration
+  and transition target configuration. Earlier requests are rejected, not
+  silently upgraded; approvals must be reissued for new canonical inputs.
+  Observation JSON is separate from command encoding.
 - **Proof validity and issuance.** `DestructiveApproval` and `FenceReference`
-  currently bind a receipt to an exact operation ID and canonical input
-  signature. They carry no issue or expiry time and no issuer verification, so
-  the type system cannot yet express an expired or forged proof, and any caller
-  able to construct an envelope can construct a receipt for it. Stage 4 owns
-  receipt lifetime and issuer authentication, alongside the external lease
-  handling that gives those fields their meaning. Until then, no code path may
-  treat the presence of a receipt as evidence that fencing actually occurred.
-  The stage 3 adapter requires an injected trusted verifier and ships a
-  deny-by-default implementation, not a permissive receipt-presence check.
+  remain references bound to the exact operation and canonical input. Stage 4
+  supplies separate signed evidence with issuer-purpose and lifetime checks,
+  plus a current-authority oracle and concrete owned-container removal checks.
+  Reference presence and successful decoding are never fencing proof. The
+  convergence adapter still defaults to denial unless a trusted verifier is
+  configured; the observer has no mutation capability.
 
 ## Why the PostgreSQL Adapter Is Not a Drop-in Template
 
@@ -292,10 +297,10 @@ automatic Kubernetes failover.
    canonical operation identity, tests, and this design.
 2. **Runtime and observation** — implemented: a replaceable TDS executor, immutable DMV
    snapshots, freshness, startup capability checks, and an observe-only CLI.
-3. **Bootstrap, join, and reseed** — the current library slice: pure convergence decisions, one native
+3. **Bootstrap, join, and reseed** — implemented: pure convergence decisions, one native
    effect at a time, durable SQL-specific result journal, and automatic-seeding
    postconditions.
-4. **Switchover, failover, and fencing** — external lease handling, sequence
+4. **Switchover, failover, and fencing** — the current standalone slice: external lease handling, sequence
    arbitration, verified fence receipts, explicit data-loss recovery, and live
    fault tests. Automatic failover remains disabled until every safety gate
    passes.

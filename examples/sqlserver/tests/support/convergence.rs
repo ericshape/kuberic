@@ -388,6 +388,7 @@ pub fn bootstrap_payload(expected: Option<Guid>) -> OperationPayload {
         name: ag().name,
         expected_group_id: expected,
         database_name: database().name,
+        write_lease_seconds: 30,
         primary: desired(1),
         replicas: authority().replicas,
     }

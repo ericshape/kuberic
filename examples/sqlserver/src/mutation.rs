@@ -92,6 +92,14 @@ pub struct MutationEndpoint {
 }
 
 impl MutationEndpoint {
+    pub(crate) fn observer(&self) -> &ObserverConfig {
+        &self.observer
+    }
+
+    pub(crate) fn replication_endpoint(&self) -> &Endpoint {
+        &self.replication_endpoint
+    }
+
     pub fn observe_only(observer: ObserverConfig, replication_endpoint: Endpoint) -> Self {
         Self {
             observer,
@@ -151,7 +159,7 @@ impl MutationEndpoint {
         Ok(())
     }
 
-    async fn connect_privileged(
+    pub(crate) async fn connect_privileged(
         &self,
         observer: &mut TdsSession,
     ) -> Result<TdsSession, RuntimeError> {
@@ -191,6 +199,14 @@ pub struct TdsAgBackend {
 }
 
 impl TdsAgBackend {
+    pub(crate) fn registered_nodes(&self) -> &[MutationEndpoint] {
+        &self.nodes
+    }
+
+    pub(crate) fn managed_database(&self) -> &SqlIdentifier {
+        &self.database_name
+    }
+
     pub fn new(
         nodes: Vec<MutationEndpoint>,
         database_name: SqlIdentifier,
@@ -250,7 +266,7 @@ impl TdsAgBackend {
         Ok(())
     }
 
-    async fn observe_node(
+    pub(crate) async fn observe_node(
         &self,
         node: &MutationEndpoint,
         mode: MutationMode,
@@ -523,6 +539,7 @@ pub(crate) fn validate_action(
                 database_name,
                 primary,
                 replicas,
+                write_lease_seconds,
             },
             NativeAction::CreateAvailabilityGroup {
                 name: actual_name,
@@ -530,6 +547,7 @@ pub(crate) fn validate_action(
                 primary: actual_primary,
                 replicas: actual_replicas,
                 expected_database_id,
+                write_lease_seconds: actual_lease,
                 ..
             },
         ) => {
@@ -538,6 +556,8 @@ pub(crate) fn validate_action(
                 && name == actual_name
                 && database_name == actual_database
                 && primary == actual_primary
+                && write_lease_seconds == actual_lease
+                && (5..=60).contains(actual_lease)
                 && *expected_database_id > 4
                 && replicas.len() == actual_replicas.len()
                 && replicas
@@ -946,6 +966,7 @@ fn render_action(
             expected_database_id,
             expected_database_guid,
             expected_recovery_fork_id,
+            write_lease_seconds,
             ..
         } => {
             if database_name != managed_database
@@ -972,7 +993,7 @@ fn render_action(
                 literal(replica.server_name.as_str()), literal(&replica.endpoint.to_string())
             )).collect::<Vec<_>>().join(",\n");
             body.push_str(&format!(
-                "CREATE AVAILABILITY GROUP {} WITH (CLUSTER_TYPE = EXTERNAL, REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = {required}) FOR DATABASE {} REPLICA ON {replicas};\n",
+                "CREATE AVAILABILITY GROUP {} WITH (CLUSTER_TYPE = EXTERNAL, DB_FAILOVER = ON, WRITE_LEASE_VALIDITY = {write_lease_seconds}, REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = {required}) FOR DATABASE {} REPLICA ON {replicas};\n",
                 name.quoted(), database_name.quoted()
             ));
         }
@@ -1304,6 +1325,7 @@ mod tests {
                     database_name: database().name,
                     primary: authority.primary.clone(),
                     replicas: authority.replicas.clone(),
+                    write_lease_seconds: 30,
                 },
             )
             .unwrap(),
@@ -1319,6 +1341,7 @@ mod tests {
             expected_database_id: 5,
             expected_database_guid: guid(3),
             expected_recovery_fork_id: guid(4),
+            write_lease_seconds: 30,
         };
         let nodes = authority
             .replicas
@@ -1389,6 +1412,7 @@ mod tests {
             expected_database_id: 5,
             expected_database_guid: guid(3),
             expected_recovery_fork_id: guid(4),
+            write_lease_seconds: 30,
         };
         let sql = render_action(
             &action,

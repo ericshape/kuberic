@@ -12,19 +12,20 @@ use crate::types::{
 
 /// Version of the canonical operation encoding.
 ///
-/// Version 2 binds bootstrap to a desired primary and destructive reseeding to
-/// the exact old local database. Version 1 is deliberately not upgraded during
-/// decoding: its approvals and fences do not authorize these stronger inputs.
-pub const OPERATION_CONTRACT_VERSION: u16 = 2;
+/// Version 3 additionally binds bootstrap to its native write-lease duration
+/// and primary transitions to a distinct target configuration and the next
+/// epoch. Versions 1 and 2 cannot authorize these stronger inputs.
+pub const OPERATION_CONTRACT_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationPayload {
-    /// Canonical v2 order: name, optional group GUID, database name, desired
-    /// primary identity, then the replica set sorted by logical ID/incarnation.
+    /// Canonical v3 order: name, optional group GUID, database name, write-lease
+    /// duration, desired primary, then members sorted by logical ID/incarnation.
     EnsureAvailabilityGroup {
         name: AvailabilityGroupName,
         expected_group_id: Option<Guid>,
         database_name: SqlIdentifier,
+        write_lease_seconds: u32,
         primary: ReplicaIdentity,
         replicas: Vec<ReplicaDescriptor>,
     },
@@ -39,7 +40,7 @@ pub enum OperationPayload {
         target: ReplicaIdentity,
     },
     /// The old-local identity tuple follows `database` and precedes
-    /// `source`/`target` in canonical v2 encoding. These identities describe
+    /// `source`/`target` in canonical v3 encoding. These identities describe
     /// the database being destroyed, not its intended replacement.
     ReseedReplica {
         availability_group: AvailabilityGroupIdentity,
@@ -56,6 +57,7 @@ pub enum OperationPayload {
         database: DatabaseLineage,
         source: ReplicaIdentity,
         target: ReplicaIdentity,
+        target_configuration_id: OpaqueId,
         commit_boundary: DecimalProgress,
     },
     ForcedFailover {
@@ -63,6 +65,7 @@ pub enum OperationPayload {
         database: DatabaseLineage,
         source: ReplicaIdentity,
         target: ReplicaIdentity,
+        target_configuration_id: OpaqueId,
         last_known_commit: Option<DecimalProgress>,
     },
 }
@@ -106,8 +109,18 @@ impl OperationPayload {
     fn validate(&self) -> Result<(), ContractError> {
         match self {
             Self::EnsureAvailabilityGroup {
-                primary, replicas, ..
+                primary,
+                replicas,
+                write_lease_seconds,
+                ..
             } => {
+                if !(5..=60).contains(write_lease_seconds) {
+                    return Err(ContractError::UnsupportedProfile {
+                        field: "operation write lease seconds",
+                        expected: "5 through 60",
+                        actual: write_lease_seconds.to_string(),
+                    });
+                }
                 if replicas.len() != usize::from(SUPPORTED_REPLICA_COUNT) {
                     return Err(ContractError::UnsupportedProfile {
                         field: "operation replica count",
@@ -199,6 +212,7 @@ impl OperationPayload {
                 name,
                 expected_group_id,
                 database_name,
+                write_lease_seconds,
                 primary,
                 replicas,
             } => {
@@ -207,7 +221,7 @@ impl OperationPayload {
                     writer.string(id.as_str());
                 });
                 writer.string(database_name.as_str());
-                // V2 encodes the desired primary before the sorted member set.
+                writer.u32(*write_lease_seconds);
                 writer.replica(primary);
 
                 let mut replicas = replicas.iter().collect::<Vec<_>>();
@@ -260,7 +274,7 @@ impl OperationPayload {
             } => {
                 writer.availability_group(availability_group);
                 writer.database(database);
-                // V2's old-local identity tuple precedes source and target.
+                // Retain the exact old-local guards introduced in v2.
                 writer.u32(*expected_database_id);
                 writer.string(expected_database_guid.as_str());
                 writer.string(expected_recovery_fork_id.as_str());
@@ -272,12 +286,14 @@ impl OperationPayload {
                 database,
                 source,
                 target,
+                target_configuration_id,
                 commit_boundary,
             } => {
                 writer.availability_group(availability_group);
                 writer.database_lineage(database);
                 writer.replica(source);
                 writer.replica(target);
+                writer.string(target_configuration_id.as_str());
                 writer.string(&commit_boundary.to_string());
             }
             Self::ForcedFailover {
@@ -285,12 +301,14 @@ impl OperationPayload {
                 database,
                 source,
                 target,
+                target_configuration_id,
                 last_known_commit,
             } => {
                 writer.availability_group(availability_group);
                 writer.database_lineage(database);
                 writer.replica(source);
                 writer.replica(target);
+                writer.string(target_configuration_id.as_str());
                 writer.optional(last_known_commit.as_ref(), |writer, progress| {
                     writer.string(&progress.to_string());
                 });
@@ -456,11 +474,36 @@ impl OperationRequest {
             });
         }
         self.payload.validate()?;
-        if self.payload.changes_primary_authority() && self.target_epoch == self.source_epoch {
-            return Err(ContractError::EpochNotAdvanced {
-                source: self.source_epoch,
-                target: self.target_epoch,
-            });
+        if self.payload.changes_primary_authority() {
+            if self.target_epoch == self.source_epoch {
+                return Err(ContractError::EpochNotAdvanced {
+                    source: self.source_epoch,
+                    target: self.target_epoch,
+                });
+            }
+            if self.source_epoch.checked_add(1) != Some(self.target_epoch) {
+                return Err(ContractError::UnsupportedProfile {
+                    field: "transition target epoch",
+                    expected: "source epoch plus one without overflow",
+                    actual: self.target_epoch.to_string(),
+                });
+            }
+        }
+        if let OperationPayload::PlannedSwitchover {
+            target_configuration_id,
+            ..
+        }
+        | OperationPayload::ForcedFailover {
+            target_configuration_id,
+            ..
+        } = &self.payload
+        {
+            if target_configuration_id == &self.source_configuration_id {
+                return Err(ContractError::DuplicateValue {
+                    field: "source and target configuration ID",
+                    value: target_configuration_id.to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -836,7 +879,7 @@ fn validate_contract_version(version: u16) -> Result<(), ContractError> {
     if version != OPERATION_CONTRACT_VERSION {
         return Err(ContractError::UnsupportedProfile {
             field: "operation contract version",
-            expected: "2",
+            expected: "3",
             actual: version.to_string(),
         });
     }

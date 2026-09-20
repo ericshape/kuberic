@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "examples/sqlserver/**"
+      - "scripts/sqlserver_ha_lab*.py"
+      - "docs/features/sqlserver/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -34,3 +36,5 @@ jobs:
         run: cargo clippy --locked -p sqlserver-replicated --all-targets --all-features -- -D warnings
       - name: Run SQL Server contract and runtime tests
         run: cargo test --locked -p sqlserver-replicated --all-features
+      - name: Verify owned laboratory safety without Docker
+        run: python3 -m unittest discover -s scripts -p sqlserver_ha_lab_test.py

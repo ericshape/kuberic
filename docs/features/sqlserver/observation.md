@@ -167,7 +167,8 @@ results.
 
 Operation-envelope serialization/decoding and the durable result journal are
 provided by the separate [AG convergence library](convergence.md). Its version
-2 command contract strengthens bootstrap/reseed identity binding. The observer's
+3 command contract binds bootstrap/reseed identities, native lease setup and
+transition configuration. The observer's
 JSON schema remains version 1: it is an output format, not an authenticated
 command protocol, and the observer CLI has no mutation path.
 

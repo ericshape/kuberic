@@ -5,9 +5,9 @@ use sqlserver_replicated::codec::{
 };
 use sqlserver_replicated::{
     AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
-    DecimalProgress, DestructiveApproval, Endpoint, FenceReference, Guid, OperationEnvelope,
-    OperationPayload, OperationRequest, ReplicaDescriptor, ReplicaIdentity, ServerName,
-    SqlIdentifier,
+    DecimalProgress, DestructiveApproval, Endpoint, FenceReference, Guid, OpaqueId,
+    OperationEnvelope, OperationPayload, OperationRequest, ReplicaDescriptor, ReplicaIdentity,
+    ServerName, SqlIdentifier,
 };
 
 fn guid(value: u32) -> Guid {
@@ -55,6 +55,7 @@ fn payloads() -> Vec<OperationPayload> {
             name: ag().name,
             expected_group_id: Some(ag().group_id),
             database_name: database().name,
+            write_lease_seconds: 30,
             primary: desired(2),
             replicas: vec![descriptor(1), descriptor(2), descriptor(3)],
         },
@@ -85,6 +86,8 @@ fn payloads() -> Vec<OperationPayload> {
             },
             source: replica(1),
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("9999999999999999999999999").unwrap(),
         },
         OperationPayload::ForcedFailover {
@@ -95,6 +98,8 @@ fn payloads() -> Vec<OperationPayload> {
             },
             source: replica(1),
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             last_known_commit: Some(DecimalProgress::parse("9999999999999999999999999").unwrap()),
         },
     ]
@@ -232,6 +237,7 @@ fn binary_bootstrap_members_must_already_be_sorted_and_count_is_bounded() {
     offset += 1;
     skip_string(&bytes, &mut offset);
     skip_string(&bytes, &mut offset);
+    offset += 4;
     skip_replica(&bytes, &mut offset);
     let count_offset = offset;
     offset += 4;
@@ -285,7 +291,7 @@ fn wrapper_is_strict_bounded_and_rejects_trailing_data() {
         assert!(!format!("{error:?}: {error}").contains("credential-not-to-echo"));
     }
     let text = String::from_utf8(encoded).unwrap();
-    let duplicate = text.replacen("\"version\":2", "\"version\":2,\"version\":2", 1);
+    let duplicate = text.replacen("\"version\":3", "\"version\":3,\"version\":3", 1);
     assert_eq!(
         decode_envelope(duplicate.as_bytes()),
         Err(CodecError::Malformed)
@@ -304,7 +310,7 @@ fn wrapper_is_strict_bounded_and_rejects_trailing_data() {
 #[test]
 fn old_and_unknown_versions_are_never_silently_upgraded() {
     let original = envelope(payloads().remove(1));
-    for version in [0, 1, 3, u16::MAX] {
+    for version in [0, 1, 2, 4, u16::MAX] {
         let mut value = dto(&original);
         value["version"] = json!(version);
         assert_eq!(decode(&value), Err(CodecError::UnsupportedVersion));
@@ -428,4 +434,96 @@ fn proof_signatures_operation_ids_and_incarnations_are_not_reconstructed() {
     let mut join = dto(&envelope(payloads().remove(1)));
     join["destructive_approval"] = dto(&original)["destructive_approval"].clone();
     assert_eq!(decode(&join), Err(CodecError::InvalidProof));
+}
+
+#[test]
+fn version_three_golden_bindings_cover_all_six_variants() {
+    // Independently assembled big-endian field encodings fix the wire contract.
+    let golden = [
+        (
+            "c1fb9d6108869f29c6f70527097102d8a29be3b42a7ec7bbcf2104d9826b835c",
+            "0582e35f48747956e90c3cec791e839f246e1d19476bd63a0e63f10e6de8b543",
+        ),
+        (
+            "246dde6cbb71784417fc2243198062cb4b3d7f115329821ea0635d9ac52e8705",
+            "11d12d066e7e3ee1d6eeeed527319a48c59580747cf1182c954000436f0d99c6",
+        ),
+        (
+            "9a779f66e28316d9c3a538b5f36e5f2f7cddbd0625be848d53acc50c8edaead9",
+            "71072a225a9ed509eb92e59ca3efa9e9beb16e0283ef419f37fb4e6cd17b8699",
+        ),
+        (
+            "e841f6de420d575ee21cf2f5a31d9bc92649b87ccc2b27600ccd29603cc94792",
+            "45643cd4f265c9247c03fc8b7a765a76eeb5d444c4064fe6a8d39a496468010e",
+        ),
+        (
+            "5158527d089ba8cbf2ef7370ba7382b10c58ebcdfea214aec8c19a1d9bc149b0",
+            "1eb93a3aeb54ed27adabd7bb6061fa86a2493d24b8625634710d70c6d32e03d2",
+        ),
+        (
+            "f76d9a94e4652c4413042d7ce5b8d52b30032ada50635006fce138fe8e844dc9",
+            "5164adcf5cafc6af9f866518853ff12e65a9323a639030e1b6d409b14fae3a53",
+        ),
+    ];
+    for (payload, (input, effect)) in payloads().into_iter().zip(golden) {
+        let envelope = envelope(payload);
+        assert_eq!(envelope.request().contract_version(), 3);
+        assert_eq!(
+            envelope.input_signature().to_string(),
+            format!("sha256:{input}")
+        );
+        assert_eq!(
+            envelope.effect_signature().to_string(),
+            format!("sha256:{effect}")
+        );
+        for version in [1, 2] {
+            let mut value = dto(&envelope);
+            value["version"] = json!(version);
+            assert_eq!(decode(&value), Err(CodecError::UnsupportedVersion));
+        }
+    }
+}
+
+#[test]
+fn version_three_decoding_rejects_invalid_write_leases_and_target_configurations() {
+    let original = envelope(payloads().remove(0));
+    let mut value = dto(&original);
+    let mut bytes = raw(&value);
+    let mut offset = payload_offset(&bytes) + 1;
+    skip_string(&bytes, &mut offset);
+    offset += 1;
+    skip_string(&bytes, &mut offset);
+    skip_string(&bytes, &mut offset);
+    for duration in [0_u32, 4, 61, u32::MAX] {
+        bytes[offset..offset + 4].copy_from_slice(&duration.to_be_bytes());
+        replace_request(&mut value, &bytes);
+        assert_eq!(decode(&value), Err(CodecError::InvalidRequest));
+    }
+    for payload in payloads().into_iter().skip(4) {
+        let original = envelope(payload);
+        let mut value = dto(&original);
+        let bytes = raw(&value);
+        let configuration = b"configuration-2";
+        let position = bytes
+            .windows(configuration.len())
+            .position(|s| s == configuration)
+            .unwrap();
+        let mut same = bytes.clone();
+        same[position..position + configuration.len()].copy_from_slice(b"configuration-1");
+        replace_request(&mut value, &same);
+        assert_eq!(decode(&value), Err(CodecError::InvalidRequest));
+        let mut missing = bytes.clone();
+        missing.splice(
+            position - 4..position + configuration.len(),
+            0_u32.to_be_bytes(),
+        );
+        replace_request(&mut value, &missing);
+        assert_eq!(decode(&value), Err(CodecError::InvalidField));
+        let mut unchanged_epoch = bytes.clone();
+        let source_position = payload_offset(&bytes) - 16;
+        unchanged_epoch[source_position..source_position + 8]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        replace_request(&mut value, &unchanged_epoch);
+        assert_eq!(decode(&value), Err(CodecError::InvalidRequest));
+    }
 }

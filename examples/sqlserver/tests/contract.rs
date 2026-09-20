@@ -2,10 +2,10 @@ use sqlserver_replicated::{
     AvailabilityGroupIdentity, AvailabilityGroupName, AvailabilityMode, ClusterType, ContractError,
     DatabaseIdentity, DatabaseLineage, DecimalProgress, DestructiveApproval, Edition, Endpoint,
     FailoverMode, FenceReference, Guid, MutationMode, NativeRole, OPERATION_CONTRACT_VERSION,
-    Observation, ObservationFailure, ObservationFailureKind, OperationEnvelope, OperationPayload,
-    OperationRecord, OperationRequest, PinnedImage, ReplayDisposition, ReplicaDescriptor,
-    ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT, SecretRef, SeedingMode,
-    ServerName, SqlIdentifier, SqlServerSupportConfig,
+    Observation, ObservationFailure, ObservationFailureKind, OpaqueId, OperationEnvelope,
+    OperationPayload, OperationRecord, OperationRequest, PinnedImage, ReplayDisposition,
+    ReplicaDescriptor, ReplicaIdentity, SUPPORTED_REPLICA_COUNT, SUPPORTED_REPLICA_COUNT_TEXT,
+    SecretRef, SeedingMode, ServerName, SqlIdentifier, SqlServerSupportConfig,
 };
 
 use std::num::NonZeroU32;
@@ -270,6 +270,7 @@ fn canonical_signature_is_stable_for_replica_set_order() {
         name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
         expected_group_id: None,
         database_name: SqlIdentifier::new("application").unwrap(),
+        write_lease_seconds: 30,
         primary: desired_replica(1),
         replicas,
     };
@@ -299,7 +300,7 @@ fn canonical_signature_is_stable_for_replica_set_order() {
     assert_eq!(envelope.input_signature(), reordered.input_signature());
     assert_eq!(
         envelope.input_signature().to_string(),
-        "sha256:04039d594d217921ed38b381e2d4a308f4068b0d35a3fd688d0e018a7d25ec30"
+        "sha256:e0b2da83dccb29040f5b950a771d51ca8b73d288cf8f8a025863800665b58293"
     );
 }
 
@@ -316,6 +317,7 @@ fn duplicate_replica_identity_is_rejected() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            write_lease_seconds: 30,
             primary: desired_replica(1),
             replicas: vec![duplicate.clone(), duplicate, descriptor(2)],
         },
@@ -342,6 +344,7 @@ fn bootstrap_uses_desired_identity_before_sql_server_generates_replica_guids() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            write_lease_seconds: 30,
             primary: desired_replica(1),
             replicas: vec![
                 ReplicaDescriptor {
@@ -529,6 +532,8 @@ fn role_transition_fence_is_bound_to_the_old_primary_incarnation() {
             database: database_lineage(30),
             source,
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("123456789").unwrap(),
         },
     );
@@ -555,6 +560,8 @@ fn fence_is_bound_to_canonical_input() {
             database: database_lineage(30),
             source: source.clone(),
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("123456789").unwrap(),
         },
     );
@@ -567,6 +574,8 @@ fn fence_is_bound_to_canonical_input() {
             database: database_lineage(30),
             source,
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("123456790").unwrap(),
         },
     );
@@ -589,6 +598,8 @@ fn progress_proof_is_bound_to_database_recovery_lineage() {
             database: database_lineage(30),
             source: source.clone(),
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("123456789").unwrap(),
         },
     );
@@ -601,6 +612,8 @@ fn progress_proof_is_bound_to_database_recovery_lineage() {
             database: database_lineage(31),
             source,
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("123456789").unwrap(),
         },
     );
@@ -627,6 +640,8 @@ fn logical_or_native_self_transition_is_rejected_across_incarnations() {
                 database: database_lineage(30),
                 source: replica(1),
                 target: same_logical_new_incarnation,
+                target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                    .unwrap(),
                 commit_boundary: DecimalProgress::parse("123").unwrap(),
             },
         ),
@@ -650,6 +665,8 @@ fn logical_or_native_self_transition_is_rejected_across_incarnations() {
                 database: database_lineage(30),
                 source: replica(1),
                 target: same_native_new_logical,
+                target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                    .unwrap(),
                 commit_boundary: DecimalProgress::parse("123").unwrap(),
             },
         ),
@@ -672,6 +689,8 @@ fn forced_failover_requires_input_bound_approval_and_source_fence() {
             database: database_lineage(30),
             source: source.clone(),
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             last_known_commit: None,
         },
     );
@@ -702,6 +721,8 @@ fn forced_failover_requires_input_bound_approval_and_source_fence() {
             database: database_lineage(30),
             source: replica(1),
             target: replica(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             last_known_commit: Some(DecimalProgress::parse("1").unwrap()),
         },
     );
@@ -747,6 +768,8 @@ fn epochs_must_not_regress() {
                 database: database_lineage(30),
                 source: replica(1),
                 target: replica(2),
+                target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                    .unwrap(),
                 commit_boundary: DecimalProgress::parse("123").unwrap(),
             },
         ),
@@ -783,6 +806,7 @@ fn endpoints_are_dns_canonical_and_duplicate_detection_is_case_insensitive() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            write_lease_seconds: 30,
             primary: desired_replica(1),
             replicas: vec![
                 ReplicaDescriptor {
@@ -835,6 +859,7 @@ fn server_name_case_does_not_change_the_idempotency_key() {
                 name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
                 expected_group_id: None,
                 database_name: SqlIdentifier::new("application").unwrap(),
+                write_lease_seconds: 30,
                 primary: desired_replica(1),
                 replicas: vec![
                     ReplicaDescriptor {
@@ -875,6 +900,7 @@ fn server_names_that_differ_only_by_case_are_rejected_as_duplicates() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            write_lease_seconds: 30,
             primary: desired_replica(1),
             replicas: vec![
                 descriptor(1),
@@ -992,19 +1018,29 @@ fn decoded_requests_must_carry_a_supported_contract_version() {
         ),
         Err(ContractError::UnsupportedProfile {
             field: "operation contract version",
-            expected: "2",
+            expected: "3",
             actual: (OPERATION_CONTRACT_VERSION + 1).to_string(),
         })
     );
-    assert_eq!(OPERATION_CONTRACT_VERSION, 2);
-    assert_eq!(
-        OperationRequest::from_decoded_parts(1, "", "join-1", "configuration-1", 1, 1, payload(),),
-        Err(ContractError::UnsupportedProfile {
-            field: "operation contract version",
-            expected: "2",
-            actual: "1".to_string(),
-        })
-    );
+    assert_eq!(OPERATION_CONTRACT_VERSION, 3);
+    for version in [1, 2] {
+        assert_eq!(
+            OperationRequest::from_decoded_parts(
+                version,
+                "",
+                "join-1",
+                "configuration-1",
+                1,
+                1,
+                payload(),
+            ),
+            Err(ContractError::UnsupportedProfile {
+                field: "operation contract version",
+                expected: "3",
+                actual: version.to_string(),
+            })
+        );
+    }
 }
 
 #[test]
@@ -1013,6 +1049,7 @@ fn bootstrap_primary_is_an_exact_desired_member_and_changes_the_bound_effect() {
         name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
         expected_group_id: None,
         database_name: SqlIdentifier::new("application").unwrap(),
+        write_lease_seconds: 30,
         primary,
         replicas: vec![descriptor(1), descriptor(2), descriptor(3)],
     };
@@ -1121,6 +1158,7 @@ fn supported_profile_constants_agree() {
                 name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
                 expected_group_id: None,
                 database_name: SqlIdentifier::new("application").unwrap(),
+                write_lease_seconds: 30,
                 primary: desired_replica(1),
                 replicas,
             },
@@ -1158,4 +1196,94 @@ fn unrecognized_native_roles_are_retained_but_validated() {
             field: "native replica role"
         })
     );
+}
+
+#[test]
+fn bootstrap_write_lease_is_bounded_and_part_of_both_canonical_bindings() {
+    let build = |write_lease_seconds| {
+        OperationRequest::new(
+            "default/example",
+            "bootstrap-lease",
+            "configuration-1",
+            1,
+            1,
+            OperationPayload::EnsureAvailabilityGroup {
+                name: availability_group().name,
+                expected_group_id: None,
+                database_name: database().name,
+                write_lease_seconds,
+                primary: desired_replica(1),
+                replicas: (1..=3).map(descriptor).collect(),
+            },
+        )
+    };
+    for duration in [0, 4, 61, u32::MAX] {
+        assert!(matches!(
+            build(duration),
+            Err(ContractError::UnsupportedProfile {
+                field: "operation write lease seconds",
+                ..
+            })
+        ));
+    }
+    let normal = build(30).unwrap();
+    for duration in [5, 60] {
+        let changed = build(duration).unwrap();
+        assert_ne!(normal.input_signature(), changed.input_signature());
+        assert_ne!(normal.effect_signature(), changed.effect_signature());
+    }
+}
+
+#[test]
+fn both_primary_transitions_bind_a_distinct_configuration_and_exact_successor_epoch() {
+    for forced in [false, true] {
+        let payload = |configuration: &str| {
+            let target_configuration_id = OpaqueId::new("target configuration", configuration)?;
+            Ok::<_, ContractError>(if forced {
+                OperationPayload::ForcedFailover {
+                    availability_group: availability_group(),
+                    database: database_lineage(30),
+                    source: replica(1),
+                    target: replica(2),
+                    target_configuration_id,
+                    last_known_commit: None,
+                }
+            } else {
+                OperationPayload::PlannedSwitchover {
+                    availability_group: availability_group(),
+                    database: database_lineage(30),
+                    source: replica(1),
+                    target: replica(2),
+                    target_configuration_id,
+                    commit_boundary: DecimalProgress::parse("123").unwrap(),
+                }
+            })
+        };
+        let build = |source, target, configuration| {
+            OperationRequest::new(
+                "default/example",
+                "transition",
+                "configuration-1",
+                source,
+                target,
+                payload(configuration)?,
+            )
+        };
+        for (source, target) in [(7, 7), (7, 9), (u64::MAX, 0), (u64::MAX, u64::MAX)] {
+            assert!(build(source, target, "configuration-2").is_err());
+        }
+        assert!(build(7, 8, "configuration-1").is_err());
+        assert!(build(7, 8, "").is_err());
+        assert!(build(u64::MAX - 1, u64::MAX, "configuration-2").is_ok());
+        let original = build(7, 8, "configuration-2").unwrap();
+        let changed = build(7, 8, "configuration-3").unwrap();
+        assert_ne!(original.input_signature(), changed.input_signature());
+        assert_ne!(original.effect_signature(), changed.effect_signature());
+        let old_fence = fence(&original, replica(1));
+        let approval = forced.then(|| approval(&changed));
+        assert_eq!(
+            OperationEnvelope::new(changed, approval, Some(old_fence)),
+            Err(ContractError::FenceInputMismatch)
+        );
+    }
 }
