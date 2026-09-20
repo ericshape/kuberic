@@ -176,19 +176,20 @@ through a watch channel. The monitor starts with no sample, supports explicit
 cancellation, and reports subscriber loss rather than silently discarding
 results.
 
-The TDS boundary contains panics while polling connection and query futures,
-never reuses a failed or interrupted session, and requires `panic = "unwind"`
-for recovery (the workspace default). Abort builds and process-level aborts
+The TDS boundary contains panics while polling connection, query, and native
+statement futures. It never reuses a failed or interrupted session and requires
+`panic = "unwind"` for recovery (the workspace default). Abort builds and process-level aborts
 cannot be recovered. A process-wide delegating panic hook suppresses payloads
 only during a driver poll, so panic text and backtraces cannot bypass sanitized
 failure reports. The previous hook still handles unrelated panics, including
 other tasks between polls. Embedders that replace the panic hook after starting
 TDS observation must preserve this delegation.
 
-Operation-envelope serialization/decoding and the durable result journal
-remain stage 3 work. The existing canonical signatures and approval/fence
-bindings are unchanged. Observation JSON is an output format, not a new
-authenticated command protocol.
+Operation-envelope serialization/decoding and the durable result journal are
+provided by the separate [AG convergence library](convergence.md). Its version
+2 command contract strengthens bootstrap/reseed identity binding. The observer's
+JSON schema remains version 1: it is an output format, not an authenticated
+command protocol, and the observer CLI has no mutation path.
 
 ## Testing
 
