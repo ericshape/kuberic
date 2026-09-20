@@ -82,6 +82,7 @@ fn bootstrap_creates_once_on_the_bound_designated_primary_with_canonical_members
             primary,
             name,
             database_name,
+            write_lease_seconds,
             replicas,
             expected_database_id,
             expected_database_guid,
@@ -90,6 +91,7 @@ fn bootstrap_creates_once_on_the_bound_designated_primary_with_canonical_members
             assert_eq!(primary, &desired(1));
             assert_eq!(name, &ag().name);
             assert_eq!(database_name, &database().name);
+            assert_eq!(*write_lease_seconds, 30);
             assert_eq!(replicas, &authority().replicas);
             assert_eq!(*expected_database_id, 5);
             assert_eq!(expected_database_guid, &guid(201));
@@ -309,6 +311,8 @@ fn v1_and_both_primary_transition_payloads_are_refused() {
             },
             source: observed(1),
             target: observed(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             commit_boundary: DecimalProgress::parse("9999999999999999999999999").unwrap(),
         },
         OperationPayload::ForcedFailover {
@@ -319,6 +323,8 @@ fn v1_and_both_primary_transition_payloads_are_refused() {
             },
             source: observed(1),
             target: observed(2),
+            target_configuration_id: OpaqueId::new("target configuration", "configuration-2")
+                .unwrap(),
             last_known_commit: None,
         },
     ] {

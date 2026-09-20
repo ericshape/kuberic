@@ -250,6 +250,7 @@ async fn live_bootstrap_join_seed_and_replay() {
             name: group_name.unwrap(),
             expected_group_id: None,
             database_name,
+            write_lease_seconds: 30,
             primary,
             replicas: authority.replicas.clone(),
         },

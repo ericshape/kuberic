@@ -12,14 +12,14 @@ mutation requires an explicit enabled mode and an embedding application's
 trusted `AuthorizationVerifier`. The shipped `DenyMutations` implementation
 refuses authorization.
 
-## Operation contract version 2
+## Operation contract version 3
 
 Version 1 described a bootstrap replica set but did not identify which member
 was allowed to execute `CREATE AVAILABILITY GROUP`. It also did not bind a
 reseed to the target's old local database incarnation. Executing those shapes
 unchanged would leave important effects outside the canonical input signature.
 
-Version 2 therefore:
+Version 2 introduced these bindings:
 
 - adds an explicit desired `primary` identity to `EnsureAvailabilityGroup`;
 - binds that primary, including incarnation, to exactly one bootstrap member;
@@ -30,13 +30,15 @@ Version 2 therefore:
 
 The bounded operation-envelope codec validates native types and canonical
 encoding before returning an envelope. It covers requests and their bound
-approval/fence references. Version 1 is rejected explicitly, not upgraded
-silently: rebuild requests and obtain new approvals against version 2.
+approval/fence references. The current version 3 also binds bootstrap write
+lease duration and transition target configuration IDs. Versions 1 and 2 are
+rejected explicitly, not upgraded silently: rebuild requests and obtain new
+approvals against version 3.
 Neither a checksum nor successful decoding authenticates a caller or proves
 that a fence was installed.
 
-`PlannedSwitchover` and `ForcedFailover` remain vocabulary for the next stage.
-The codec can preserve them, but this adapter refuses to execute them.
+`PlannedSwitchover` and `ForcedFailover` are handled by the separate
+[HA controller](ha.md). This convergence adapter continues to refuse them.
 
 ## Authority and security boundary
 
@@ -54,10 +56,11 @@ target incarnation and operation inputs. The fence and command authority must
 remain effective throughout the operation, including uncertain native effects.
 A point-in-time check of a receipt string is insufficient.
 
-No production fence/approval issuer or authenticator is included here. Their
-implementation, lifetime rules, write-lease handling and failover arbitration
-belong to stage 4. Supplying an allow-all verifier defeats the safety boundary;
-the crate deliberately does not provide one.
+The [HA layer](ha.md) supplies Ed25519 proof verification, current-authority
+checks, and an owned-container fencing provider. It does not make raw receipt
+references trustworthy, and its laboratory provider is not a generic cloud
+fencer. Supplying an allow-all verifier defeats the safety boundary; no such
+production implementation is provided.
 
 Observation and mutation use separate mounted credential files **and distinct
 server principals**. The backend checks their server SIDs and that the two

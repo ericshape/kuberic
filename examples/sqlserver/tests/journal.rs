@@ -7,13 +7,14 @@ use std::process::Command;
 
 use rusqlite::{Connection, params};
 use sqlserver_replicated::journal::{
-    JournalError, MAX_ACTION_PAYLOAD_BYTES, MAX_ACTIONS_PER_OPERATION, MAX_AUTHORITY_BINDING_BYTES,
-    MAX_RESULT_BYTES, OperationJournal, Registration,
+    JOURNAL_SCHEMA_VERSION, JournalError, MAX_ACTION_PAYLOAD_BYTES, MAX_ACTIONS_PER_OPERATION,
+    MAX_AUTHORITY_BINDING_BYTES, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINTS, MAX_RESULT_BYTES,
+    OperationJournal, Registration, TransitionCommit,
 };
 use sqlserver_replicated::{
-    AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DestructiveApproval,
-    FenceReference, Guid, OperationEnvelope, OperationPayload, OperationRequest, ReplicaIdentity,
-    SqlIdentifier,
+    AvailabilityGroupIdentity, AvailabilityGroupName, DatabaseIdentity, DatabaseLineage,
+    DecimalProgress, DestructiveApproval, FenceReference, Guid, OpaqueId, OperationEnvelope,
+    OperationPayload, OperationRequest, ReplicaIdentity, SqlIdentifier,
 };
 use tempfile::TempDir;
 
@@ -694,6 +695,10 @@ fn journal_process_helper() {
 fn unknown_or_changed_schema_and_non_sqlite_files_are_rejected() {
     for (sql, expected) in [
         (
+            "PRAGMA user_version = 1",
+            JournalError::UnsupportedSchemaVersion,
+        ),
+        (
             "PRAGMA user_version = 999",
             JournalError::UnsupportedSchemaVersion,
         ),
@@ -704,6 +709,7 @@ fn unknown_or_changed_schema_and_non_sqlite_files_are_rejected() {
         ),
         ("DROP INDEX operations_effect", JournalError::CorruptSchema),
         ("DROP TABLE actions", JournalError::CorruptSchema),
+        ("DROP TABLE checkpoints", JournalError::CorruptSchema),
     ] {
         let directory = directory();
         let path = directory.path().join("journal.db");
@@ -766,6 +772,7 @@ fn malformed_oversized_records_and_old_operation_contracts_are_rejected() {
         "oversized-action",
         "bad-epoch",
         "old-contract",
+        "previous-contract",
     ] {
         let directory = directory();
         let path = directory.path().join("journal.db");
@@ -776,6 +783,7 @@ fn malformed_oversized_records_and_old_operation_contracts_are_rejected() {
                 .persist_intent("join-1", "join", b"opaque-action")
                 .unwrap();
         }
+
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch("PRAGMA ignore_check_constraints = ON")
@@ -796,12 +804,12 @@ fn malformed_oversized_records_and_old_operation_contracts_are_rejected() {
                     .execute("UPDATE journal_metadata SET epoch = X'07'", [])
                     .unwrap();
             }
-            "old-contract" => {
+            "old-contract" | "previous-contract" => {
                 let bytes: Vec<u8> = connection
                     .query_row("SELECT envelope FROM operations", [], |row| row.get(0))
                     .unwrap();
                 let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                value["version"] = serde_json::json!(1);
+                value["version"] = serde_json::json!(if kind == "old-contract" { 1 } else { 2 });
                 connection
                     .execute(
                         "UPDATE operations SET envelope = ?1",
@@ -818,4 +826,705 @@ fn malformed_oversized_records_and_old_operation_contracts_are_rejected() {
             Err(JournalError::CorruptRecord | JournalError::CorruptSchema)
         ));
     }
+}
+
+fn transition(forced: bool, epoch: u64) -> OperationEnvelope {
+    let database = DatabaseLineage {
+        database: DatabaseIdentity {
+            name: SqlIdentifier::new("app").unwrap(),
+            group_database_id: guid(20),
+        },
+        recovery_fork_id: guid(30),
+    };
+    let target_configuration_id = OpaqueId::new("configuration", "configuration-next").unwrap();
+    let payload = if forced {
+        OperationPayload::ForcedFailover {
+            availability_group: ag(),
+            database,
+            source: replica(1),
+            target: replica(2),
+            target_configuration_id,
+            last_known_commit: None,
+        }
+    } else {
+        OperationPayload::PlannedSwitchover {
+            availability_group: ag(),
+            database,
+            source: replica(1),
+            target: replica(2),
+            target_configuration_id,
+            commit_boundary: DecimalProgress::parse("500").unwrap(),
+        }
+    };
+    let request = OperationRequest::new(
+        RESOURCE,
+        "transition-1",
+        CONFIGURATION,
+        epoch,
+        epoch + 1,
+        payload,
+    )
+    .unwrap();
+    let approval = forced.then(|| {
+        DestructiveApproval::new(
+            "explicit-data-loss",
+            request.operation_id(),
+            request.input_signature(),
+        )
+        .unwrap()
+    });
+    let fence = FenceReference::new(
+        "verified-container-removal",
+        "fence",
+        request.operation_id(),
+        request.input_signature(),
+        replica(1),
+    )
+    .unwrap();
+    OperationEnvelope::new(request, approval, Some(fence)).unwrap()
+}
+
+fn transition_commit(epoch: u64) -> TransitionCommit {
+    TransitionCommit {
+        configuration_id: "configuration-next".into(),
+        epoch: epoch + 1,
+        binding: b"authenticated-target-authority".to_vec(),
+        checkpoint_name: "ha-controller".into(),
+        checkpoint: b"target-is-active-and-pending-is-cleared".to_vec(),
+    }
+}
+
+#[test]
+fn checkpoints_are_bounded_integrity_checked_durable_and_read_only_when_queried() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 2);
+    assert_eq!(journal.checkpoint("controller").unwrap(), None);
+    assert!(journal.pending_entry().unwrap().is_none());
+    journal.put_checkpoint("controller", b"pending").unwrap();
+    let before = fs::read(&path).unwrap();
+    assert_eq!(
+        journal.checkpoint("controller").unwrap().as_deref(),
+        Some(b"pending".as_slice())
+    );
+    assert_eq!(journal.checkpoint("missing").unwrap(), None);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    // Inspection must work while the exclusive writer is still alive and must
+    // not create a second writer or release its lifetime flock.
+    let pair = OperationJournal::inspect_read_only(&path, RESOURCE, "controller").unwrap();
+    assert_eq!(pair.0, journal.authority().unwrap());
+    assert_eq!(pair.1.as_deref(), Some(b"pending".as_slice()));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(matches!(
+        OperationJournal::open(&path, RESOURCE),
+        Err(JournalError::Busy)
+    ));
+    assert_eq!(
+        OperationJournal::inspect_read_only(&path, "foreign", "controller"),
+        Err(JournalError::ResourceMismatch)
+    );
+    let missing = directory.path().join("missing.db");
+    assert!(OperationJournal::inspect_read_only(&missing, RESOURCE, "controller").is_err());
+    assert!(!missing.exists());
+    assert!(!missing.with_extension("db.lock").exists());
+    assert_eq!(journal.checkpoint(""), Err(JournalError::InvalidInput));
+    assert_eq!(
+        journal.put_checkpoint("", b"v"),
+        Err(JournalError::InvalidInput)
+    );
+    assert_eq!(
+        journal.put_checkpoint("controller", &vec![0; MAX_CHECKPOINT_BYTES + 1]),
+        Err(JournalError::TooLarge)
+    );
+    assert_eq!(
+        journal.checkpoint("controller").unwrap().as_deref(),
+        Some(b"pending".as_slice())
+    );
+    journal
+        .put_checkpoint("controller", &vec![255; MAX_CHECKPOINT_BYTES])
+        .unwrap();
+    journal.put_checkpoint("empty", b"").unwrap();
+    drop(journal);
+    let journal = open(&path);
+    assert_eq!(
+        journal.checkpoint("controller").unwrap(),
+        Some(vec![255; MAX_CHECKPOINT_BYTES])
+    );
+    assert_eq!(journal.checkpoint("empty").unwrap(), Some(Vec::new()));
+}
+
+#[test]
+fn read_only_inspection_never_creates_a_missing_lock_sidecar_or_mutates_the_database() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    journal
+        .put_checkpoint("ha-control", b"active-epoch-7")
+        .unwrap();
+    let authority = journal.authority().unwrap();
+    drop(journal);
+
+    let snapshot = directory.path().join("read-only.db");
+    fs::copy(&path, &snapshot).unwrap();
+    let before = fs::read(&snapshot).unwrap();
+    assert!(!snapshot.with_extension("db.lock").exists());
+    assert_eq!(
+        OperationJournal::inspect_read_only(&snapshot, RESOURCE, "ha-control").unwrap(),
+        (authority, Some(b"active-epoch-7".to_vec()))
+    );
+    assert_eq!(fs::read(&snapshot).unwrap(), before);
+    assert!(!snapshot.with_extension("db.lock").exists());
+    assert!(!snapshot.with_extension("db-journal").exists());
+}
+
+#[test]
+fn read_only_inspection_observes_committed_state_and_denies_genuine_sqlite_busy() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    journal
+        .put_checkpoint("ha-control", b"active-epoch-7")
+        .unwrap();
+    let authority = journal.authority().unwrap();
+    let blocker = Connection::open(&path).unwrap();
+    blocker
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+         UPDATE checkpoints SET value = X'00' WHERE name = 'ha-control';",
+        )
+        .unwrap();
+    assert_eq!(
+        OperationJournal::inspect_read_only(&path, RESOURCE, "ha-control").unwrap(),
+        (authority, Some(b"active-epoch-7".to_vec()))
+    );
+    blocker.execute_batch("ROLLBACK; BEGIN EXCLUSIVE;").unwrap();
+    assert_eq!(
+        OperationJournal::inspect_read_only(&path, RESOURCE, "ha-control"),
+        Err(JournalError::Busy)
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert_eq!(
+        journal.checkpoint("ha-control").unwrap(),
+        Some(b"active-epoch-7".to_vec())
+    );
+    assert!(matches!(
+        OperationJournal::open(&path, RESOURCE),
+        Err(JournalError::Busy)
+    ));
+}
+
+#[test]
+fn pending_entry_exposes_unresolved_pr3_intents_read_only_before_any_ha_freeze() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    let operation = reseed("approval", "fence");
+    journal.register(&operation).unwrap();
+    journal
+        .persist_intent(operation.operation_id(), "detach", b"possibly-dispatched")
+        .unwrap();
+    journal
+        .persist_intent(operation.operation_id(), "earlier-step", b"acknowledged")
+        .unwrap();
+    journal
+        .acknowledge_action(operation.operation_id(), "earlier-step")
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let authority = journal.authority().unwrap();
+    let pending = journal.pending_entry().unwrap().unwrap();
+    assert_eq!(pending.envelope, operation);
+    assert!(pending.terminal_result.is_none());
+    assert_eq!(pending.actions.len(), 2);
+    assert_eq!(pending.pending_intents().count(), 1);
+    assert_eq!(journal.authority().unwrap(), authority);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(
+        journal.register(&transition(false, EPOCH)),
+        Err(JournalError::OperationInProgress)
+    );
+    journal
+        .finish(operation.operation_id(), b"verified-pr3-postcondition")
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(journal.pending_entry().unwrap().is_none());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(
+        journal
+            .entry(operation.operation_id())
+            .unwrap()
+            .unwrap()
+            .actions,
+        pending.actions
+    );
+}
+
+#[test]
+fn checkpoint_count_is_bounded_but_existing_checkpoints_remain_updatable() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    for index in 0..MAX_CHECKPOINTS {
+        journal
+            .put_checkpoint(&format!("checkpoint-{index}"), b"value")
+            .unwrap();
+    }
+    assert_eq!(
+        journal.put_checkpoint("one-too-many", b"value"),
+        Err(JournalError::TooManyCheckpoints)
+    );
+    journal
+        .put_checkpoint("checkpoint-0", b"replacement")
+        .unwrap();
+    assert_eq!(
+        journal.checkpoint("checkpoint-0").unwrap().as_deref(),
+        Some(b"replacement".as_slice())
+    );
+    let operation = transition(false, EPOCH);
+    journal.register(&operation).unwrap();
+    assert_eq!(
+        journal.finish_transition(
+            operation.operation_id(),
+            b"result",
+            &transition_commit(EPOCH)
+        ),
+        Err(JournalError::TooManyCheckpoints)
+    );
+    assert!(
+        journal
+            .entry(operation.operation_id())
+            .unwrap()
+            .unwrap()
+            .terminal_result
+            .is_none()
+    );
+    assert_eq!(journal.authority().unwrap().unwrap().epoch, EPOCH);
+}
+
+#[test]
+fn checkpoint_deletion_renaming_corruption_and_oversized_values_fail_closed() {
+    for sql in [
+        "UPDATE checkpoints SET value = X'00'",
+        "UPDATE checkpoints SET value_hash = zeroblob(32)",
+        "UPDATE checkpoints SET name = 'different-controller'",
+        "DELETE FROM checkpoints",
+        "UPDATE journal_metadata SET checkpoints_hash = zeroblob(32)",
+        "PRAGMA ignore_check_constraints = ON; UPDATE checkpoints SET value = zeroblob(65537)",
+    ] {
+        let directory = directory();
+        let path = directory.path().join("journal.db");
+        let mut journal = authorized(&path);
+        journal.put_checkpoint("controller", b"valid").unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(sql).unwrap();
+        drop(connection);
+        assert!(journal.checkpoint("controller").is_err(), "{sql}");
+        assert!(
+            journal
+                .put_checkpoint("controller", b"must-not-repair")
+                .is_err(),
+            "{sql}"
+        );
+        assert!(
+            OperationJournal::inspect_read_only(&path, RESOURCE, "controller").is_err(),
+            "{sql}"
+        );
+        drop(journal);
+        assert!(
+            matches!(
+                OperationJournal::open(&path, RESOURCE),
+                Err(JournalError::CorruptRecord | JournalError::CorruptSchema)
+            ),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn transition_atomically_commits_target_result_checkpoint_and_retains_all_intents() {
+    for forced in [false, true] {
+        let directory = directory();
+        let path = directory.path().join("journal.db");
+        let mut journal = authorized(&path);
+        journal
+            .put_checkpoint("ha-controller", b"source-with-pending-transition")
+            .unwrap();
+        let operation = transition(forced, EPOCH);
+        let commit = transition_commit(EPOCH);
+        assert_eq!(journal.register(&operation).unwrap(), Registration::New);
+        journal
+            .persist_intent(operation.operation_id(), "promote", b"exact-promotion")
+            .unwrap();
+        journal
+            .persist_intent(
+                operation.operation_id(),
+                "secondary-reset",
+                b"uncertain-reset",
+            )
+            .unwrap();
+        journal
+            .acknowledge_action(operation.operation_id(), "promote")
+            .unwrap();
+        let before = journal.pending_entry().unwrap().unwrap();
+        let inspected =
+            OperationJournal::inspect_read_only(&path, RESOURCE, "ha-controller").unwrap();
+        assert_eq!(inspected.0.unwrap().epoch, EPOCH);
+        assert_eq!(
+            inspected.1.as_deref(),
+            Some(b"source-with-pending-transition".as_slice())
+        );
+        journal
+            .finish_transition(
+                operation.operation_id(),
+                b"verified-native-postcondition",
+                &commit,
+            )
+            .unwrap();
+        let completed = journal.entry(operation.operation_id()).unwrap().unwrap();
+        assert_eq!(completed.actions, before.actions);
+        assert_eq!(completed.pending_intents().count(), 1);
+        assert_eq!(completed.transition_commit, Some(commit.clone()));
+        assert!(journal.pending_entry().unwrap().is_none());
+        let (authority, checkpoint) =
+            OperationJournal::inspect_read_only(&path, RESOURCE, "ha-controller").unwrap();
+        let authority = authority.unwrap();
+        assert_eq!(authority.configuration_id, commit.configuration_id);
+        assert_eq!(authority.epoch, commit.epoch);
+        assert_eq!(authority.binding, commit.binding);
+        assert_eq!(checkpoint, Some(commit.checkpoint.clone()));
+        drop(journal);
+        let mut journal = open(&path);
+        assert_eq!(
+            journal.entry(operation.operation_id()).unwrap(),
+            Some(completed)
+        );
+        assert_eq!(
+            journal.register(&operation).unwrap(),
+            Registration::Completed(b"verified-native-postcondition".to_vec())
+        );
+        journal
+            .finish_transition(
+                operation.operation_id(),
+                b"verified-native-postcondition",
+                &commit,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn transition_failure_rolls_back_checkpoint_authority_and_result_together() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    journal
+        .put_checkpoint("ha-controller", b"source-pending")
+        .unwrap();
+    let operation = transition(false, EPOCH);
+    journal.register(&operation).unwrap();
+    journal
+        .persist_intent(operation.operation_id(), "promote", b"possibly-dispatched")
+        .unwrap();
+    let old_entry = journal.entry(operation.operation_id()).unwrap();
+    let old_authority = journal.authority().unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER injected_failure BEFORE UPDATE OF result ON operations
+                 WHEN NEW.result IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    assert_eq!(
+        journal.finish_transition(
+            operation.operation_id(),
+            b"result",
+            &transition_commit(EPOCH)
+        ),
+        Err(JournalError::Storage)
+    );
+    assert_eq!(journal.entry(operation.operation_id()).unwrap(), old_entry);
+    assert_eq!(journal.authority().unwrap(), old_authority);
+    assert_eq!(
+        journal.checkpoint("ha-controller").unwrap().as_deref(),
+        Some(b"source-pending".as_slice())
+    );
+    connection
+        .execute_batch("DROP TRIGGER injected_failure")
+        .unwrap();
+    drop(connection);
+    drop(journal);
+    let mut journal = open(&path);
+    assert_eq!(journal.entry(operation.operation_id()).unwrap(), old_entry);
+    journal
+        .finish_transition(
+            operation.operation_id(),
+            b"result",
+            &transition_commit(EPOCH),
+        )
+        .unwrap();
+}
+
+#[test]
+fn transition_rejects_wrong_operation_configuration_epoch_and_non_atomic_finish() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    let commit = transition_commit(EPOCH);
+    assert_eq!(
+        journal.finish_transition("missing", b"result", &commit),
+        Err(JournalError::UnknownOperation)
+    );
+    journal.register(&join("join-1", 2)).unwrap();
+    assert_eq!(
+        journal.finish_transition("join-1", b"result", &commit),
+        Err(JournalError::InvalidTransition)
+    );
+    journal.finish("join-1", b"join-result").unwrap();
+    let operation = transition(false, EPOCH);
+    journal.register(&operation).unwrap();
+    assert_eq!(
+        journal.finish(operation.operation_id(), b"result"),
+        Err(JournalError::InvalidTransition)
+    );
+    assert_eq!(
+        journal.finish_observed_duplicate(&operation, b"result"),
+        Err(JournalError::InvalidTransition)
+    );
+    let changes: &[fn(&mut TransitionCommit)] = &[
+        |c| c.configuration_id = CONFIGURATION.into(),
+        |c| c.configuration_id = "unrequested-target".into(),
+        |c| c.epoch = EPOCH,
+        |c| c.epoch = EPOCH + 2,
+        |c| c.epoch = u64::MAX,
+    ];
+    for change in changes {
+        let mut bad = commit.clone();
+        change(&mut bad);
+        assert_eq!(
+            journal.finish_transition(operation.operation_id(), b"result", &bad),
+            Err(JournalError::InvalidTransition)
+        );
+    }
+    assert_eq!(journal.authority().unwrap().unwrap().epoch, EPOCH);
+    assert_eq!(journal.checkpoint("ha-controller").unwrap(), None);
+    assert!(journal.pending_entry().unwrap().is_some());
+    assert_eq!(
+        journal.accept_authority("cannot-skip", EPOCH + 2, b"binding"),
+        Err(JournalError::OperationInProgress)
+    );
+}
+
+#[test]
+fn transition_requires_the_current_source_authority_including_after_pending_corruption() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    let operation = transition(false, EPOCH);
+    journal.register(&operation).unwrap();
+    // Build a separately valid metadata row for a different accepted authority,
+    // simulating external replacement rather than merely a broken hash.
+    let other_path = directory.path().join("other.db");
+    let mut other = open(&other_path);
+    other
+        .accept_authority("other-source", EPOCH, BINDING)
+        .unwrap();
+    drop(other);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "ATTACH DATABASE ?1 AS other",
+            [other_path.to_str().unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "UPDATE journal_metadata SET
+                 configuration_id = (SELECT configuration_id FROM other.journal_metadata),
+                 state_hash = (SELECT state_hash FROM other.journal_metadata);",
+        )
+        .unwrap();
+    assert_eq!(
+        journal.finish_transition(
+            operation.operation_id(),
+            b"result",
+            &transition_commit(EPOCH)
+        ),
+        Err(JournalError::AuthorityMismatch)
+    );
+    assert!(
+        journal
+            .entry(operation.operation_id())
+            .unwrap()
+            .unwrap()
+            .terminal_result
+            .is_none()
+    );
+    assert_eq!(journal.checkpoint("ha-controller").unwrap(), None);
+    drop(connection);
+    drop(journal);
+    assert_open_error(&path, JournalError::CorruptRecord);
+}
+
+#[test]
+fn terminal_transition_replay_is_exact_immutable_and_cannot_rewind_later_state() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    let operation = transition(false, EPOCH);
+    let commit = transition_commit(EPOCH);
+    journal.register(&operation).unwrap();
+    journal
+        .finish_transition(operation.operation_id(), b"result", &commit)
+        .unwrap();
+    assert_eq!(
+        journal.finish_transition(operation.operation_id(), b"changed-result", &commit),
+        Err(JournalError::ResultConflict)
+    );
+    let changes: &[fn(&mut TransitionCommit)] = &[
+        |c| c.binding.push(1),
+        |c| c.checkpoint.push(1),
+        |c| c.checkpoint_name = "different-controller".into(),
+    ];
+    for change in changes {
+        let mut bad = commit.clone();
+        change(&mut bad);
+        assert_eq!(
+            journal.finish_transition(operation.operation_id(), b"result", &bad),
+            Err(JournalError::TransitionConflict)
+        );
+    }
+    journal
+        .put_checkpoint("ha-controller", b"later-lease-state")
+        .unwrap();
+    journal
+        .accept_authority("later-authority", EPOCH + 2, b"later-binding")
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    journal
+        .finish_transition(operation.operation_id(), b"result", &commit)
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(journal.authority().unwrap().unwrap().epoch, EPOCH + 2);
+    assert_eq!(
+        journal.checkpoint("ha-controller").unwrap().as_deref(),
+        Some(b"later-lease-state".as_slice())
+    );
+    drop(journal);
+    let mut journal = open(&path);
+    journal
+        .finish_transition(operation.operation_id(), b"result", &commit)
+        .unwrap();
+}
+
+#[test]
+fn transition_commit_bounds_are_checked_without_changing_pending_records() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = authorized(&path);
+    let operation = transition(false, EPOCH);
+    journal.register(&operation).unwrap();
+    let changes: &[fn(&mut TransitionCommit)] = &[
+        |c| c.binding.clear(),
+        |c| c.binding = vec![0; MAX_AUTHORITY_BINDING_BYTES + 1],
+        |c| c.checkpoint_name.clear(),
+        |c| c.checkpoint_name = "x".repeat(257),
+        |c| c.configuration_id.clear(),
+        |c| c.checkpoint = vec![0; MAX_CHECKPOINT_BYTES + 1],
+    ];
+    for change in changes {
+        let mut commit = transition_commit(EPOCH);
+        change(&mut commit);
+        assert!(
+            journal
+                .finish_transition(operation.operation_id(), b"result", &commit)
+                .is_err()
+        );
+        assert!(journal.pending_entry().unwrap().is_some());
+        assert_eq!(journal.checkpoint("ha-controller").unwrap(), None);
+    }
+    assert_eq!(
+        journal.finish_transition(
+            operation.operation_id(),
+            &vec![0; MAX_RESULT_BYTES + 1],
+            &transition_commit(EPOCH)
+        ),
+        Err(JournalError::TooLarge)
+    );
+    let mut largest = transition_commit(EPOCH);
+    largest.binding = vec![255; MAX_AUTHORITY_BINDING_BYTES];
+    largest.checkpoint = vec![255; MAX_CHECKPOINT_BYTES];
+    journal
+        .finish_transition(
+            operation.operation_id(),
+            &vec![255; MAX_RESULT_BYTES],
+            &largest,
+        )
+        .unwrap();
+    drop(journal);
+    let journal = open(&path);
+    assert_eq!(
+        journal
+            .entry(operation.operation_id())
+            .unwrap()
+            .unwrap()
+            .transition_commit,
+        Some(largest)
+    );
+}
+
+#[test]
+fn immutable_transition_commit_corruption_cannot_be_replayed_as_success() {
+    for sql in [
+        "UPDATE operations SET transition_commit = NULL",
+        "UPDATE operations SET transition_commit = X'7b7d'",
+        "UPDATE operations SET transition_commit = zeroblob(294913)",
+        "DELETE FROM checkpoints",
+    ] {
+        let directory = directory();
+        let path = directory.path().join("journal.db");
+        let mut journal = authorized(&path);
+        let operation = transition(false, EPOCH);
+        journal.register(&operation).unwrap();
+        journal
+            .finish_transition(
+                operation.operation_id(),
+                b"result",
+                &transition_commit(EPOCH),
+            )
+            .unwrap();
+        drop(journal);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        connection.execute_batch(sql).unwrap();
+        drop(connection);
+        assert!(matches!(
+            OperationJournal::open(&path, RESOURCE),
+            Err(JournalError::CorruptRecord | JournalError::CorruptSchema)
+        ));
+    }
+}
+
+#[test]
+fn exact_last_representable_transition_epoch_remains_lossless() {
+    let directory = directory();
+    let path = directory.path().join("journal.db");
+    let mut journal = open(&path);
+    journal
+        .accept_authority(CONFIGURATION, u64::MAX - 1, BINDING)
+        .unwrap();
+    let operation = transition(false, u64::MAX - 1);
+    let commit = transition_commit(u64::MAX - 1);
+    journal.register(&operation).unwrap();
+    journal
+        .finish_transition(operation.operation_id(), b"result", &commit)
+        .unwrap();
+    drop(journal);
+    let mut journal = open(&path);
+    assert_eq!(journal.authority().unwrap().unwrap().epoch, u64::MAX);
+    journal
+        .finish_transition(operation.operation_id(), b"result", &commit)
+        .unwrap();
 }

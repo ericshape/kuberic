@@ -33,9 +33,9 @@ impl AcceptedAuthority {
             .validate()
             .map_err(|_| authority_error("invalid operation envelope"))?;
         let request = envelope.request();
-        if request.contract_version() != 2 {
+        if request.contract_version() != crate::OPERATION_CONTRACT_VERSION {
             return Err(authority_error(
-                "convergence requires operation contract version 2",
+                "convergence requires operation contract version 3",
             ));
         }
         if matches!(
@@ -186,6 +186,7 @@ pub enum NativeAction {
         primary: ReplicaIdentity,
         name: AvailabilityGroupName,
         database_name: SqlIdentifier,
+        write_lease_seconds: u32,
         replicas: Vec<ReplicaDescriptor>,
         /// Dispatch guards are part of the persisted action, not new request
         /// fields. A retry must not retarget an already-journaled intent.
@@ -337,6 +338,7 @@ fn plan_checked(
             name,
             expected_group_id,
             database_name,
+            write_lease_seconds,
             ..
         } => bootstrap(
             authority,
@@ -345,6 +347,7 @@ fn plan_checked(
             name,
             expected_group_id.as_ref(),
             database_name,
+            *write_lease_seconds,
             acknowledged,
         ),
         OperationPayload::EnsureReplicaJoined {
@@ -862,6 +865,7 @@ fn check_probe_consistency(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bootstrap(
     authority: &AcceptedAuthority,
     nodes: &BTreeMap<&str, Node<'_>>,
@@ -869,6 +873,7 @@ fn bootstrap(
     name: &AvailabilityGroupName,
     expected_group_id: Option<&Guid>,
     database_name: &SqlIdentifier,
+    write_lease_seconds: u32,
     acknowledged: &BTreeSet<String>,
 ) -> Check<Decision> {
     for member in &authority.replicas {
@@ -912,6 +917,7 @@ fn bootstrap(
                 primary: authority.primary.clone(),
                 name: name.clone(),
                 database_name: database_name.clone(),
+                write_lease_seconds,
                 replicas: ordered_members(&authority.replicas)
                     .into_iter()
                     .cloned()

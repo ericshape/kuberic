@@ -22,17 +22,22 @@ use rusqlite::types::ValueRef;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::codec::{MAX_ENVELOPE_BYTES, decode_envelope, encode_envelope};
-use crate::operation::OperationEnvelope;
+use crate::operation::{OperationEnvelope, OperationPayload};
 use crate::types::OpaqueId;
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+/// Schema 1 is deliberately rejected, not reset or silently migrated.
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
 pub const MAX_ACTION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_RESULT_BYTES: usize = 64 * 1024;
 pub const MAX_AUTHORITY_BINDING_BYTES: usize = 4096;
 pub const MAX_ACTIONS_PER_OPERATION: usize = 128;
+pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
+pub const MAX_CHECKPOINTS: usize = 64;
+const MAX_TRANSITION_COMMIT_BYTES: usize = 288 * 1024;
 const APPLICATION_ID: i64 = 0x4b53514a;
 
 const METADATA_SCHEMA: &str = "CREATE TABLE journal_metadata (
@@ -42,6 +47,7 @@ const METADATA_SCHEMA: &str = "CREATE TABLE journal_metadata (
     epoch BLOB,
     binding BLOB,
     state_hash BLOB NOT NULL CHECK (length(state_hash) = 32),
+    checkpoints_hash BLOB NOT NULL CHECK (length(checkpoints_hash) = 32),
     CHECK ((configuration_id IS NULL AND epoch IS NULL AND binding IS NULL)
         OR (configuration_id IS NOT NULL AND epoch IS NOT NULL AND length(epoch) = 8
             AND binding IS NOT NULL AND length(binding) BETWEEN 1 AND 4096))
@@ -54,11 +60,19 @@ const OPERATIONS_SCHEMA: &str = "CREATE TABLE operations (
     envelope BLOB NOT NULL CHECK (length(envelope) BETWEEN 1 AND 65536),
     result BLOB CHECK (result IS NULL OR length(result) <= 65536),
     result_hash BLOB,
+    transition_commit BLOB CHECK (transition_commit IS NULL
+        OR (result IS NOT NULL AND length(transition_commit) BETWEEN 1 AND 294912)),
     record_hash BLOB NOT NULL CHECK (length(record_hash) = 32),
     pending INTEGER UNIQUE CHECK (pending IS NULL OR pending = 1),
     CHECK ((result IS NULL AND result_hash IS NULL AND pending IS NOT NULL AND pending = 1)
         OR (result IS NOT NULL AND result_hash IS NOT NULL
             AND length(result_hash) = 32 AND pending IS NULL))
+) STRICT";
+
+const CHECKPOINTS_SCHEMA: &str = "CREATE TABLE checkpoints (
+    name TEXT PRIMARY KEY NOT NULL,
+    value BLOB NOT NULL CHECK (length(value) <= 65536),
+    value_hash BLOB NOT NULL CHECK (length(value_hash) = 32)
 ) STRICT";
 
 const ACTIONS_SCHEMA: &str = "CREATE TABLE actions (
@@ -99,6 +113,9 @@ pub enum JournalError {
     NotDuplicateEffect,
     TooLarge,
     TooManyActions,
+    TooManyCheckpoints,
+    InvalidTransition,
+    TransitionConflict,
 }
 
 impl fmt::Display for JournalError {
@@ -129,6 +146,11 @@ impl fmt::Display for JournalError {
             Self::NotDuplicateEffect => "operation has no registered duplicate effect",
             Self::TooLarge => "operation journal value exceeds its size limit",
             Self::TooManyActions => "operation journal action count exceeds its limit",
+            Self::TooManyCheckpoints => "operation journal checkpoint count exceeds its limit",
+            Self::InvalidTransition => {
+                "operation requires an exact next-epoch HA transition commit"
+            }
+            Self::TransitionConflict => "terminal HA transition commit is immutable",
         })
     }
 }
@@ -141,6 +163,21 @@ pub struct AcceptedAuthority {
     pub epoch: u64,
     pub binding: Vec<u8>,
 }
+
+/// The controller supplies this only after verifying native HA completion.
+/// The target authority, terminal result, and controller checkpoint commit in
+/// the same FULL-durable SQLite transaction. No fence is authenticated here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionCommit {
+    pub configuration_id: String,
+    pub epoch: u64,
+    pub binding: Vec<u8>,
+    pub checkpoint_name: String,
+    pub checkpoint: Vec<u8>,
+}
+
+pub type JournalInspection = (Option<AcceptedAuthority>, Option<Vec<u8>>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Registration {
@@ -171,6 +208,9 @@ pub struct JournalEntry {
     /// All immutable action intents are retained, including after completion.
     pub actions: Vec<ActionIntent>,
     pub terminal_result: Option<Vec<u8>>,
+    /// Immutable commit inputs, retained even after the current authority or
+    /// controller checkpoint subsequently changes.
+    pub transition_commit: Option<TransitionCommit>,
 }
 
 impl JournalEntry {
@@ -300,6 +340,75 @@ impl OperationJournal {
         load_authority(&self.connection, &self.resource_id)
     }
 
+    /// Reads a validated checkpoint without creating or changing any record.
+    pub fn checkpoint(&self, name: &str) -> Result<Option<Vec<u8>>, JournalError> {
+        validate_id(name)?;
+        load_authority(&self.connection, &self.resource_id)?;
+        load_checkpoint(&self.connection, &self.resource_id, name)
+    }
+
+    /// Replaces one bounded checkpoint in a FULL-durable transaction. A
+    /// checkpoint is opaque controller state, never proof of a native effect.
+    pub fn put_checkpoint(&mut self, name: &str, value: &[u8]) -> Result<(), JournalError> {
+        validate_id(name)?;
+        bounded(value, MAX_CHECKPOINT_BYTES)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let authority = load_authority(&transaction, &self.resource_id)?;
+        if load_checkpoint(&transaction, &self.resource_id, name)?.as_deref() == Some(value) {
+            return Ok(());
+        }
+        store_checkpoint(&transaction, &self.resource_id, name, value)?;
+        store_authority(&transaction, &self.resource_id, authority.as_ref())?;
+        transaction.commit().map_err(sql_error)
+    }
+
+    /// Reads a coherent authority/checkpoint pair without taking the writer's
+    /// lifetime flock, creating files, or performing recovery writes. Used by a
+    /// proof oracle while the local controller owns the writer. SQLite's read
+    /// transaction prevents observing half of a transition; busy/corrupt stores
+    /// are failures, never an empty authority.
+    pub fn inspect_read_only(
+        path: &Path,
+        resource_id: &str,
+        checkpoint_name: &str,
+    ) -> Result<JournalInspection, JournalError> {
+        if !cfg!(unix) {
+            return Err(JournalError::UnsupportedPlatform);
+        }
+        validate_id(resource_id)?;
+        validate_id(checkpoint_name)?;
+        let path = resolve_path(path)?;
+        let metadata = fs::metadata(&path).map_err(|_| JournalError::Io)?;
+        verify_path_identity(&path, &metadata)?;
+        let mut connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(sql_error)?;
+        connection.busy_timeout(Duration::ZERO).map_err(sql_error)?;
+        connection
+            .execute_batch(
+                "PRAGMA query_only = ON;
+                 PRAGMA trusted_schema = OFF;
+                 PRAGMA temp_store = MEMORY;",
+            )
+            .map_err(sql_error)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(sql_error)?;
+        validate_version(&transaction)?;
+        validate_schema_and_records(&transaction, resource_id)?;
+        let authority = load_authority(&transaction, resource_id)?;
+        let checkpoint = load_checkpoint(&transaction, resource_id, checkpoint_name)?;
+        verify_path_identity(&path, &metadata)?;
+        Ok((authority, checkpoint))
+    }
+
     /// Call only after independently authenticating the configuration and
     /// authority fingerprint. Even a higher epoch cannot replace authority
     /// while an operation is unresolved; recovering it must not lose its fence.
@@ -384,6 +493,7 @@ impl OperationJournal {
                 envelope: envelope.clone(),
                 actions: Vec::new(),
                 terminal_result: None,
+                transition_commit: None,
             },
         )?;
         transaction.commit().map_err(sql_error)?;
@@ -397,6 +507,26 @@ impl OperationJournal {
         validate_id(operation_id)?;
         load_authority(&self.connection, &self.resource_id)?;
         load_entry(&self.connection, &self.resource_id, operation_id)
+    }
+
+    /// Read-only recovery of the unique unresolved operation, if any. Check
+    /// before freezing authority or fencing for HA: even acknowledged PR3
+    /// intents remain unresolved until their native postcondition is completed.
+    pub fn pending_entry(&self) -> Result<Option<JournalEntry>, JournalError> {
+        load_authority(&self.connection, &self.resource_id)?;
+        let id = self
+            .connection
+            .query_row(
+                "SELECT operation_id FROM operations WHERE pending = 1",
+                [],
+                |row| read_text(row, 0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        id.map(|id| {
+            load_entry(&self.connection, &self.resource_id, &id)?.ok_or(JournalError::CorruptRecord)
+        })
+        .transpose()
     }
 
     /// Read-only request lookup, preferring its exact ID and otherwise finding
@@ -517,6 +647,9 @@ impl OperationJournal {
             .map_err(sql_error)?;
         let mut entry = load_entry(&transaction, &self.resource_id, operation_id)?
             .ok_or(JournalError::UnknownOperation)?;
+        if transition_target(&entry.envelope).is_some() {
+            return Err(JournalError::InvalidTransition);
+        }
         if let Some(existing) = entry.terminal_result {
             return if existing == result {
                 Ok(())
@@ -525,6 +658,59 @@ impl OperationJournal {
             };
         }
         entry.terminal_result = Some(result.to_vec());
+        store_entry(&transaction, &entry)?;
+        transaction.commit().map_err(sql_error)
+    }
+
+    /// Completes only a bound PlannedSwitchover/ForcedFailover. Source authority
+    /// must still own pending work; target configuration and exactly next epoch
+    /// come from the immutable request. Exact terminal replay is read-only even
+    /// after later authority/checkpoint changes. Every action intent is retained.
+    pub fn finish_transition(
+        &mut self,
+        operation_id: &str,
+        result: &[u8],
+        commit: &TransitionCommit,
+    ) -> Result<(), JournalError> {
+        validate_id(operation_id)?;
+        bounded(result, MAX_RESULT_BYTES)?;
+        validate_transition_commit(commit)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let authority = load_authority(&transaction, &self.resource_id)?;
+        let mut entry = load_entry(&transaction, &self.resource_id, operation_id)?
+            .ok_or(JournalError::UnknownOperation)?;
+        require_transition(&entry.envelope, commit)?;
+        if let Some(existing) = &entry.terminal_result {
+            if existing != result {
+                return Err(JournalError::ResultConflict);
+            }
+            return if entry.transition_commit.as_ref() == Some(commit) {
+                Ok(())
+            } else {
+                Err(JournalError::TransitionConflict)
+            };
+        }
+        require_authority(authority.as_ref(), &entry.envelope)?;
+        store_checkpoint(
+            &transaction,
+            &self.resource_id,
+            &commit.checkpoint_name,
+            &commit.checkpoint,
+        )?;
+        store_authority(
+            &transaction,
+            &self.resource_id,
+            Some(&AcceptedAuthority {
+                configuration_id: commit.configuration_id.clone(),
+                epoch: commit.epoch,
+                binding: commit.binding.clone(),
+            }),
+        )?;
+        entry.terminal_result = Some(result.to_vec());
+        entry.transition_commit = Some(commit.clone());
         store_entry(&transaction, &entry)?;
         transaction.commit().map_err(sql_error)
     }
@@ -541,6 +727,9 @@ impl OperationJournal {
     ) -> Result<(), JournalError> {
         validate_envelope(envelope, &self.resource_id)?;
         bounded(observed_result, MAX_RESULT_BYTES)?;
+        if transition_target(envelope).is_some() {
+            return Err(JournalError::InvalidTransition);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -571,6 +760,7 @@ impl OperationJournal {
                 envelope: envelope.clone(),
                 actions: Vec::new(),
                 terminal_result: Some(observed_result.to_vec()),
+                transition_commit: None,
             },
         )?;
         transaction.commit().map_err(sql_error)
@@ -596,6 +786,7 @@ fn initialize_or_validate(
             METADATA_SCHEMA,
             OPERATIONS_SCHEMA,
             ACTIONS_SCHEMA,
+            CHECKPOINTS_SCHEMA,
             EFFECT_INDEX,
         ] {
             transaction.execute_batch(schema).map_err(sql_error)?;
@@ -609,13 +800,31 @@ fn initialize_or_validate(
         store_authority(&transaction, resource_id, None)?;
         transaction.commit().map_err(sql_error)?;
     } else {
-        if version != JOURNAL_SCHEMA_VERSION {
-            return Err(JournalError::UnsupportedSchemaVersion);
-        }
-        if app != APPLICATION_ID {
-            return Err(JournalError::CorruptSchema);
-        }
+        validate_version(connection)?;
     }
+    validate_schema_and_records(connection, resource_id)
+}
+
+fn validate_version(connection: &Connection) -> Result<(), JournalError> {
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(sql_error)?;
+    if version != JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
+    let app: i64 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(sql_error)?;
+    if app != APPLICATION_ID {
+        return Err(JournalError::CorruptSchema);
+    }
+    Ok(())
+}
+
+fn validate_schema_and_records(
+    connection: &Connection,
+    resource_id: &str,
+) -> Result<(), JournalError> {
     let mut schema = connection
         .prepare("SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
         .map_err(sql_error)?;
@@ -628,6 +837,7 @@ fn initialize_or_validate(
         .map_err(sql_error)?;
     let expected = [
         ("actions", ACTIONS_SCHEMA),
+        ("checkpoints", CHECKPOINTS_SCHEMA),
         ("journal_metadata", METADATA_SCHEMA),
         ("operations", OPERATIONS_SCHEMA),
         ("operations_effect", EFFECT_INDEX),
@@ -675,6 +885,15 @@ fn initialize_or_validate(
         {
             return Err(JournalError::CorruptRecord);
         }
+        if let Some(commit) = &entry.transition_commit {
+            if commit.epoch > accepted.epoch
+                || (commit.epoch == accepted.epoch
+                    && (commit.configuration_id != accepted.configuration_id
+                        || commit.binding != accepted.binding))
+            {
+                return Err(JournalError::CorruptRecord);
+            }
+        }
     }
     Ok(())
 }
@@ -683,9 +902,9 @@ fn load_authority(
     connection: &Connection,
     resource_id: &str,
 ) -> Result<Option<AcceptedAuthority>, JournalError> {
-    let (resource, configuration, epoch, binding, hash) = connection
+    let (resource, configuration, epoch, binding, hash, checkpoints) = connection
         .query_row(
-            "SELECT resource_id, configuration_id, epoch, binding, state_hash
+            "SELECT resource_id, configuration_id, epoch, binding, state_hash, checkpoints_hash
              FROM journal_metadata WHERE singleton = 1",
             [],
             |row| {
@@ -695,6 +914,7 @@ fn load_authority(
                     read_optional_blob(row, 2, 8)?,
                     read_optional_blob(row, 3, MAX_AUTHORITY_BINDING_BYTES)?,
                     read_blob(row, 4, 32)?,
+                    read_blob(row, 5, 32)?,
                 ))
             },
         )
@@ -717,6 +937,9 @@ fn load_authority(
     if hash != authority_hash(&resource, authority.as_ref()) {
         return Err(JournalError::CorruptRecord);
     }
+    if checkpoints != checkpoint_set_hash(connection, &resource)? {
+        return Err(JournalError::CorruptRecord);
+    }
     if resource != resource_id {
         return Err(JournalError::ResourceMismatch);
     }
@@ -737,20 +960,23 @@ fn store_authority(
     authority: Option<&AcceptedAuthority>,
 ) -> Result<(), JournalError> {
     let epoch = authority.map(|authority| authority.epoch.to_be_bytes());
+    let checkpoints = checkpoint_set_hash(connection, resource_id)?;
     connection
         .execute(
             "INSERT INTO journal_metadata
-                (singleton, resource_id, configuration_id, epoch, binding, state_hash)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                (singleton, resource_id, configuration_id, epoch, binding, state_hash, checkpoints_hash)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(singleton) DO UPDATE SET
                 configuration_id = excluded.configuration_id,
-                epoch = excluded.epoch, binding = excluded.binding, state_hash = excluded.state_hash",
+                epoch = excluded.epoch, binding = excluded.binding, state_hash = excluded.state_hash,
+                checkpoints_hash = excluded.checkpoints_hash",
             params![
                 resource_id,
                 authority.map(|authority| authority.configuration_id.as_str()),
                 epoch.as_ref().map(|epoch| epoch.as_slice()),
                 authority.map(|authority| authority.binding.as_slice()),
                 authority_hash(resource_id, authority).as_slice(),
+                checkpoints.as_slice(),
             ],
         )
         .map_err(sql_error)?;
@@ -765,7 +991,7 @@ fn load_entry(
     let record = connection
         .query_row(
             "SELECT envelope, input_signature, effect_signature, result, result_hash,
-                record_hash, pending FROM operations WHERE operation_id = ?1",
+                record_hash, pending, transition_commit FROM operations WHERE operation_id = ?1",
             [operation_id],
             |row| {
                 Ok((
@@ -776,12 +1002,15 @@ fn load_entry(
                     read_optional_blob(row, 4, 32)?,
                     read_blob(row, 5, 32)?,
                     row.get::<_, Option<i64>>(6)?,
+                    read_optional_blob(row, 7, MAX_TRANSITION_COMMIT_BYTES)?,
                 ))
             },
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((encoded, input, effect, result, result_hash, record_hash, pending)) = record else {
+    let Some((encoded, input, effect, result, result_hash, record_hash, pending, transition)) =
+        record
+    else {
         return Ok(None);
     };
     let envelope = decode_envelope(&encoded).map_err(|_| JournalError::CorruptRecord)?;
@@ -796,6 +1025,25 @@ fn load_entry(
         (None, None, Some(1)) => {}
         (Some(result), Some(hash), None) if hash.as_slice() == digest(result) => {}
         _ => return Err(JournalError::CorruptRecord),
+    }
+    let transition_commit = transition
+        .map(|encoded| {
+            let commit: TransitionCommit =
+                serde_json::from_slice(&encoded).map_err(|_| JournalError::CorruptRecord)?;
+            validate_transition_commit(&commit).map_err(|_| JournalError::CorruptRecord)?;
+            require_transition(&envelope, &commit).map_err(|_| JournalError::CorruptRecord)?;
+            if serde_json::to_vec(&commit).map_err(|_| JournalError::CorruptRecord)? != encoded {
+                return Err(JournalError::CorruptRecord);
+            }
+            Ok(commit)
+        })
+        .transpose()?;
+    if (transition_commit.is_some() && result.is_none())
+        || (result.is_some()
+            && transition_target(&envelope).is_some()
+            && transition_commit.is_none())
+    {
+        return Err(JournalError::CorruptRecord);
     }
     let mut statement = connection
         .prepare(
@@ -836,6 +1084,7 @@ fn load_entry(
         envelope,
         actions,
         terminal_result: result,
+        transition_commit,
     };
     if record_hash != entry_hash(&entry, &encoded) {
         return Err(JournalError::CorruptRecord);
@@ -846,16 +1095,25 @@ fn load_entry(
 fn store_entry(connection: &Transaction<'_>, entry: &JournalEntry) -> Result<(), JournalError> {
     let encoded = encode_envelope(&entry.envelope).map_err(|_| JournalError::InvalidEnvelope)?;
     let result_hash = entry.terminal_result.as_deref().map(digest);
+    let transition = entry
+        .transition_commit
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| JournalError::InvalidInput)?;
+    if let Some(value) = &transition {
+        bounded(value, MAX_TRANSITION_COMMIT_BYTES)?;
+    }
     connection
         .execute(
             "INSERT INTO operations
                 (operation_id, input_signature, effect_signature, envelope,
-                 result, result_hash, record_hash, pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 result, result_hash, record_hash, pending, transition_commit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(operation_id) DO UPDATE SET
                 envelope = excluded.envelope, result = excluded.result,
                 result_hash = excluded.result_hash, record_hash = excluded.record_hash,
-                pending = excluded.pending",
+                pending = excluded.pending, transition_commit = excluded.transition_commit",
             params![
                 entry.envelope.operation_id(),
                 entry.envelope.input_signature().as_bytes().as_slice(),
@@ -865,6 +1123,7 @@ fn store_entry(connection: &Transaction<'_>, entry: &JournalEntry) -> Result<(),
                 result_hash.as_ref().map(|hash| hash.as_slice()),
                 entry_hash(entry, &encoded).as_slice(),
                 entry.terminal_result.is_none().then_some(1),
+                transition,
             ],
         )
         .map_err(sql_error)?;
@@ -957,6 +1216,146 @@ fn validate_envelope(envelope: &OperationEnvelope, resource_id: &str) -> Result<
     Ok(())
 }
 
+fn transition_target(envelope: &OperationEnvelope) -> Option<&str> {
+    match envelope.request().payload() {
+        OperationPayload::PlannedSwitchover {
+            target_configuration_id,
+            ..
+        }
+        | OperationPayload::ForcedFailover {
+            target_configuration_id,
+            ..
+        } => Some(target_configuration_id.as_str()),
+        _ => None,
+    }
+}
+
+fn validate_transition_commit(commit: &TransitionCommit) -> Result<(), JournalError> {
+    validate_id(&commit.configuration_id)?;
+    validate_id(&commit.checkpoint_name)?;
+    if commit.binding.is_empty() {
+        return Err(JournalError::InvalidInput);
+    }
+    bounded(&commit.binding, MAX_AUTHORITY_BINDING_BYTES)?;
+    bounded(&commit.checkpoint, MAX_CHECKPOINT_BYTES)
+}
+
+fn require_transition(
+    envelope: &OperationEnvelope,
+    commit: &TransitionCommit,
+) -> Result<(), JournalError> {
+    let request = envelope.request();
+    if transition_target(envelope) != Some(commit.configuration_id.as_str())
+        || request.target_epoch() != commit.epoch
+        || request.source_epoch().checked_add(1) != Some(commit.epoch)
+        || request.source_configuration_id() == commit.configuration_id
+    {
+        return Err(JournalError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn checkpoint_hash(resource_id: &str, name: &str, value: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash_field(&mut hash, b"kuberic.sqlserver.journal.checkpoint.v1");
+    hash_field(&mut hash, resource_id.as_bytes());
+    hash_field(&mut hash, name.as_bytes());
+    hash_field(&mut hash, value);
+    hash.finalize().into()
+}
+
+fn load_checkpoint(
+    connection: &Connection,
+    resource_id: &str,
+    name: &str,
+) -> Result<Option<Vec<u8>>, JournalError> {
+    let record = connection
+        .query_row(
+            "SELECT value, value_hash FROM checkpoints WHERE name = ?1",
+            [name],
+            |row| {
+                Ok((
+                    read_blob(row, 0, MAX_CHECKPOINT_BYTES)?,
+                    read_blob(row, 1, 32)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    record
+        .map(|(value, hash)| {
+            if hash != checkpoint_hash(resource_id, name, &value) {
+                return Err(JournalError::CorruptRecord);
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn checkpoint_set_hash(
+    connection: &Connection,
+    resource_id: &str,
+) -> Result<[u8; 32], JournalError> {
+    let mut statement = connection
+        .prepare("SELECT name, value, value_hash FROM checkpoints ORDER BY name LIMIT ?1")
+        .map_err(sql_error)?;
+    let mut rows = statement
+        .query([(MAX_CHECKPOINTS + 1) as i64])
+        .map_err(sql_error)?;
+    let mut hash = Sha256::new();
+    hash_field(&mut hash, b"kuberic.sqlserver.journal.checkpoint-set.v1");
+    hash_field(&mut hash, resource_id.as_bytes());
+    let mut count = 0_u64;
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        if count == MAX_CHECKPOINTS as u64 {
+            return Err(JournalError::CorruptRecord);
+        }
+        let name = read_text(row, 0).map_err(sql_error)?;
+        validate_id(&name).map_err(|_| JournalError::CorruptRecord)?;
+        let value = read_blob(row, 1, MAX_CHECKPOINT_BYTES).map_err(sql_error)?;
+        let stored = read_blob(row, 2, 32).map_err(sql_error)?;
+        if stored != checkpoint_hash(resource_id, &name, &value) {
+            return Err(JournalError::CorruptRecord);
+        }
+        hash_field(&mut hash, name.as_bytes());
+        hash_field(&mut hash, &stored);
+        count += 1;
+    }
+    hash.update(count.to_be_bytes());
+    Ok(hash.finalize().into())
+}
+
+fn store_checkpoint(
+    connection: &Transaction<'_>,
+    resource_id: &str,
+    name: &str,
+    value: &[u8],
+) -> Result<(), JournalError> {
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE name = ?1)",
+            [name],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    if !exists {
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM checkpoints", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        if count >= MAX_CHECKPOINTS as i64 {
+            return Err(JournalError::TooManyCheckpoints);
+        }
+    }
+    connection
+        .execute(
+            "INSERT INTO checkpoints (name, value, value_hash) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value, value_hash = excluded.value_hash",
+            params![name, value, checkpoint_hash(resource_id, name, value).as_slice()],
+        )
+        .map_err(sql_error)?;
+    Ok(())
+}
+
 fn authority_hash(resource: &str, authority: Option<&AcceptedAuthority>) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash_field(&mut hash, b"kuberic.sqlserver.journal.authority.v1");
@@ -975,13 +1374,24 @@ fn authority_hash(resource: &str, authority: Option<&AcceptedAuthority>) -> [u8;
 
 fn entry_hash(entry: &JournalEntry, encoded: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash_field(&mut hash, b"kuberic.sqlserver.journal.entry.v1");
+    hash_field(&mut hash, b"kuberic.sqlserver.journal.entry.v2");
     hash_field(&mut hash, entry.envelope.operation_id().as_bytes());
     hash_field(&mut hash, encoded);
     match &entry.terminal_result {
         Some(result) => {
             hash.update([1]);
             hash_field(&mut hash, result);
+        }
+        None => hash.update([0]),
+    }
+    match &entry.transition_commit {
+        Some(commit) => {
+            hash.update([1]);
+            hash_field(&mut hash, commit.configuration_id.as_bytes());
+            hash.update(commit.epoch.to_be_bytes());
+            hash_field(&mut hash, &commit.binding);
+            hash_field(&mut hash, commit.checkpoint_name.as_bytes());
+            hash_field(&mut hash, &commit.checkpoint);
         }
         None => hash.update([0]),
     }

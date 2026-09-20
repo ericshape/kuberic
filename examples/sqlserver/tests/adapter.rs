@@ -62,6 +62,7 @@ fn request(id: &str) -> OperationEnvelope {
                 name: AvailabilityGroupName::new("group").unwrap(),
                 expected_group_id: None,
                 database_name: SqlIdentifier::new("database").unwrap(),
+                write_lease_seconds: 30,
                 primary: authority.primary,
                 replicas: authority.replicas,
             },
