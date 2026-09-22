@@ -1,3 +1,5 @@
+mod panic_boundary;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -30,7 +32,7 @@ impl TdsExecutor {
 }
 
 struct TdsSession {
-    client: Client<Compat<TcpStream>>,
+    client: Option<Client<Compat<TcpStream>>>,
     query_timeout: Duration,
 }
 
@@ -58,11 +60,14 @@ impl SqlExecutor for TdsExecutor {
                     "cannot configure the SQL Server connection",
                 )
             })?;
-            let client = Client::connect(config, tcp.compat_write())
-                .await
-                .map_err(|error| driver_error("TLS/TDS login", error))?;
+            let client = panic_boundary::contain("TLS/TDS login", async {
+                Client::connect(config, tcp.compat_write())
+                    .await
+                    .map_err(|error| driver_error("TLS/TDS login", error))
+            })
+            .await?;
             Ok(Box::new(TdsSession {
-                client,
+                client: Some(client),
                 query_timeout: self.settings.query_timeout,
             }) as Box<dyn SqlSession>)
         })
@@ -77,6 +82,7 @@ fn connection_config(settings: &ConnectionSettings, username: &str, password: &s
     config.port(settings.endpoint.port());
     config.database("master");
     config.application_name("kuberic-sqlserver-observer");
+    // Required avoids both plaintext fallback and the driver's On/Off panic.
     config.encryption(EncryptionLevel::Required);
     if let Some(path) = &settings.ca_certificate_file {
         // Config validation rejects non-UTF-8 paths before this point.
@@ -95,67 +101,83 @@ impl SqlSession for TdsSession {
         query: ReadQuery,
         availability_group: &AvailabilityGroupName,
     ) -> Result<Vec<QueryRow>, RuntimeError> {
-        timeout(self.query_timeout, async {
-            let name = availability_group.as_str();
-            let mut stream = self
-                .client
-                .query(query.sql(), &[&name])
-                .await
-                .map_err(|error| driver_error(query.label(), error))?;
-            let mut rows = Vec::new();
-            let mut result_sets = 0;
-            while let Some(item) = stream
-                .try_next()
-                .await
-                .map_err(|error| driver_error(query.label(), error))?
-            {
-                match item {
-                    QueryItem::Metadata(metadata) => {
-                        result_sets += 1;
-                        if result_sets != 1 {
-                            return Err(malformed(
-                                query.label(),
-                                "unexpected multiple result sets",
-                            ));
-                        }
-                        validate_columns(query, metadata.columns())?;
-                    }
-                    QueryItem::Row(row) => {
-                        if rows.len() == MAX_QUERY_ROWS {
-                            return Err(malformed(
-                                query.label(),
-                                "query exceeds the 4096-row observation limit",
-                            ));
-                        }
-                        let mut values = QueryRow::new();
-                        for (index, column) in row.columns().iter().enumerate() {
-                            let value = row.try_get::<&str, _>(index).map_err(|_| {
-                                malformed(query.label(), "expected a text or NULL DMV column")
-                            })?;
-                            if value.is_some_and(|text| text.len() > MAX_CELL_BYTES) {
+        // The future owns the client, so an error, panic, or cancellation cannot
+        // leave a partially decoded session available for another query.
+        let mut client = self.client.take().ok_or_else(|| {
+            malformed(
+                query.label(),
+                "TDS session is closed; reconnect before observing",
+            )
+        })?;
+        let (client, rows) = timeout(
+            self.query_timeout,
+            panic_boundary::contain(query.label(), async move {
+                let name = availability_group.as_str();
+                let mut stream = client
+                    .query(query.sql(), &[&name])
+                    .await
+                    .map_err(|error| driver_error(query.label(), error))?;
+                let mut rows = Vec::new();
+                let mut result_sets = 0;
+                while let Some(item) = stream
+                    .try_next()
+                    .await
+                    .map_err(|error| driver_error(query.label(), error))?
+                {
+                    match item {
+                        QueryItem::Metadata(metadata) => {
+                            result_sets += 1;
+                            if result_sets != 1 {
                                 return Err(malformed(
                                     query.label(),
-                                    "DMV column exceeds the size limit",
+                                    "unexpected multiple result sets",
                                 ));
                             }
-                            if values
-                                .insert(column.name().to_owned(), value.map(str::to_owned))
-                                .is_some()
-                            {
-                                return Err(malformed(query.label(), "duplicate DMV column name"));
-                            }
+                            validate_columns(query, metadata.columns())?;
                         }
-                        rows.push(values);
+                        QueryItem::Row(row) => {
+                            if rows.len() == MAX_QUERY_ROWS {
+                                return Err(malformed(
+                                    query.label(),
+                                    "query exceeds the 4096-row observation limit",
+                                ));
+                            }
+                            let mut values = QueryRow::new();
+                            for (index, column) in row.columns().iter().enumerate() {
+                                let value = row.try_get::<&str, _>(index).map_err(|_| {
+                                    malformed(query.label(), "expected a text or NULL DMV column")
+                                })?;
+                                if value.is_some_and(|text| text.len() > MAX_CELL_BYTES) {
+                                    return Err(malformed(
+                                        query.label(),
+                                        "DMV column exceeds the size limit",
+                                    ));
+                                }
+                                if values
+                                    .insert(column.name().to_owned(), value.map(str::to_owned))
+                                    .is_some()
+                                {
+                                    return Err(malformed(
+                                        query.label(),
+                                        "duplicate DMV column name",
+                                    ));
+                                }
+                            }
+                            rows.push(values);
+                        }
                     }
                 }
-            }
-            if result_sets != 1 {
-                return Err(malformed(query.label(), "missing DMV result set"));
-            }
-            Ok(rows)
-        })
+                if result_sets != 1 {
+                    return Err(malformed(query.label(), "missing DMV result set"));
+                }
+                drop(stream);
+                Ok((client, rows))
+            }),
+        )
         .await
-        .map_err(|_| timed_out(query.label()))?
+        .map_err(|_| timed_out(query.label()))??;
+        self.client = Some(client);
+        Ok(rows)
     }
 }
 
@@ -301,6 +323,26 @@ mod tests {
         assert_eq!(
             server_error(Some(208)).0,
             ObservationFailureKind::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn discarded_tds_sessions_require_a_new_connection() {
+        let mut session = TdsSession {
+            client: None,
+            query_timeout: Duration::from_secs(1),
+        };
+        let error = session
+            .query(
+                ReadQuery::Permissions,
+                &AvailabilityGroupName::new("test-ag").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ObservationFailureKind::Malformed);
+        assert_eq!(
+            error.message,
+            "TDS session is closed; reconnect before observing"
         );
     }
 

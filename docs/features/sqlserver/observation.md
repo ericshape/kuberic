@@ -52,6 +52,13 @@ connection hostname are still verified. This TDS CA is not the AG endpoint
 certificate: AG endpoint authentication and private-key management remain
 separate provisioning concerns.
 
+The driver's system-root loader also honors `SSL_CERT_FILE`. Missing,
+unreadable, invalid, or empty system roots can make the pinned driver panic.
+These panics, like malformed PRELOGIN panics, become sanitized `malformed`
+failure records at the `TLS/TDS login` stage; the connection is discarded and
+watch mode retries. Check both the peer protocol and TLS trust configuration
+when that record reports a driver panic. No trust or encryption check is bypassed.
+
 ### Configuration
 
 The example contains all configuration fields. Optional values default to:
@@ -164,6 +171,15 @@ connection/sample lifecycle and `SqlServerMonitor` publishes complete reports
 through a watch channel. The monitor starts with no sample, supports explicit
 cancellation, and reports subscriber loss rather than silently discarding
 results.
+
+The TDS boundary contains panics while polling connection and query futures,
+never reuses a failed or interrupted session, and requires `panic = "unwind"`
+for recovery (the workspace default). Abort builds and process-level aborts
+cannot be recovered. A process-wide delegating panic hook suppresses payloads
+only during a driver poll, so panic text and backtraces cannot bypass sanitized
+failure reports. The previous hook still handles unrelated panics, including
+other tasks between polls. Embedders that replace the panic hook after starting
+TDS observation must preserve this delegation.
 
 Operation-envelope serialization/decoding and the durable result journal
 remain stage 3 work. The existing canonical signatures and approval/fence

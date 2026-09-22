@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/tds.rs"]
+mod tds_peer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +16,7 @@ use sqlserver_replicated::runtime_config::ObserverConfig;
 use sqlserver_replicated::runtime_error::RuntimeError;
 use sqlserver_replicated::tds::TdsExecutor;
 use sqlserver_replicated::{DecimalProgress, Observation, ObservationFailureKind};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -295,19 +297,13 @@ async fn a_server_cannot_downgrade_the_observer_to_plaintext_login() {
     fixture.document["port"] = json!(listener.local_addr().unwrap().port());
     let executor = TdsExecutor::new(fixture.config().connection().clone());
     let peer = async {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut header = [0; 8];
-        stream.read_exact(&mut header).await.unwrap();
-        assert_eq!(header[0], 0x12);
-        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
-        assert!((8..4096).contains(&length));
-        let mut payload = vec![0; length - 8];
-        stream.read_exact(&mut payload).await.unwrap();
         // A PRELOGIN response advertising ENCRYPT_NOT_SUP.
-        stream
-            .write_all(&[4, 1, 0, 15, 0, 0, 1, 0, 1, 0, 6, 0, 1, 255, 2])
-            .await
-            .unwrap();
+        let mut stream = tds_peer::respond_to_prelogin(
+            &listener,
+            &[4, 1, 0, 15, 0, 0, 1, 0, 1, 0, 6, 0, 1, 255, 2],
+        )
+        .await;
+        let mut header = [0; 8];
         stream.read_exact(&mut header).await.unwrap();
         assert_eq!(
             header[0], 0x12,
