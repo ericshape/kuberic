@@ -1370,6 +1370,41 @@ async fn malformed_progress_cannot_be_rounded_narrowed_or_defaulted() {
 }
 
 #[tokio::test]
+async fn observes_manual_secondary_startup_without_inferred_replica_state() {
+    let mut script = present_script();
+    for replica in &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[1..] {
+        set(replica, "seeding_mode", Some("1"));
+        set(replica, "seeding_mode_desc", Some("MANUAL"));
+    }
+    let snapshot = success(script).await;
+    let group = group(&snapshot);
+    assert_eq!(group.replicas[0].seeding_mode, "AUTOMATIC");
+    assert_eq!(group.replicas[1].seeding_mode, "MANUAL");
+    assert_eq!(group.replicas[2].seeding_mode, "MANUAL");
+    assert_eq!(
+        group.replicas[1].state.as_ref().unwrap().role,
+        Some(NativeRole::Secondary)
+    );
+    assert!(group.replicas[2].state.is_none());
+}
+
+#[tokio::test]
+async fn manual_primary_and_unknown_seeding_modes_remain_unsupported() {
+    let mut script = present_script();
+    let primary = &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[0];
+    set(primary, "seeding_mode", Some("1"));
+    set(primary, "seeding_mode_desc", Some("MANUAL"));
+    failure(script, ObservationFailureKind::Unsupported).await;
+    for (numeric, descriptor) in [("2", "MANUAL"), ("1", "FUTURE"), ("1", "manual")] {
+        let mut script = present_script();
+        let secondary = &mut rows_mut(&mut script, ReadQuery::Replicas, 0)[1];
+        set(secondary, "seeding_mode", Some(numeric));
+        set(secondary, "seeding_mode_desc", Some(descriptor));
+        failure(script, ObservationFailureKind::Unsupported).await;
+    }
+}
+
+#[tokio::test]
 async fn rejects_unsupported_ag_and_replica_configuration_without_inferred_health() {
     for (column, value) in [
         ("cluster_type", "0"),

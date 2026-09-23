@@ -147,6 +147,18 @@ The source must be the accepted native primary and must configure the exact
 target replica GUID. An already matching secondary is complete. JOIN never
 runs over a primary or a present, different native group.
 
+Before JOIN, the adapter durably prepares and dispatches a separate
+`disable_automatic_seeding` action on the primary for that exact target. It
+requires fresh native `MANUAL` seeding mode before issuing JOIN, so a secondary
+cannot start automatic seeding before its AG has permission to create the
+database. A lost command reply can be recovered through the observed mode;
+an acknowledgement alone does not authorize JOIN while the mode is still
+`AUTOMATIC`. Active, unknown, or failed seeding blocks this preparatory action;
+it is not a way to cancel a copy. Already joined secondaries are not disabled.
+If a JOIN intent already exists while the source still shows `AUTOMATIC`, the
+adapter refuses to insert a disabling step ahead of that uncertain effect.
+This also prevents silently reordering a JOIN retained by an older adapter.
+
 EXTERNAL JOIN is named in T-SQL; it has no public join-by-GUID argument. If
 target metadata has not yet been discovered, authenticated source authority
 and registered peer bindings are required. The executor checks the resulting
@@ -156,14 +168,19 @@ result does not enable seeding and is not treated as success.
 ### Automatic seeding
 
 The adapter grants the target AG `CREATE ANY DATABASE`, then requests automatic
-seeding on the source. A retained grant/trigger acknowledgement is scheduling
-evidence, not a synchronization proof. Native in-progress seeding is observed
+seeding on the source by restoring that replica to `SEEDING_MODE = AUTOMATIC`.
+`MANUAL` is an allowed intermediate mode only for non-primary members; the
+designated primary must remain `AUTOMATIC`. Each mode change, JOIN, and grant
+is its own authorized, journaled native effect. A retained grant/trigger
+acknowledgement is scheduling evidence, not a synchronization proof.
+Native in-progress seeding is observed
 without restarting it. Failure or an unrelated same-named target database is
 reported explicitly.
 
 Completion requires the correct database/replica GUIDs, compatible local
 recovery lineage, and native `ONLINE`, `SYNCHRONIZED`, healthy, unsuspended target
-state. It never compares a hardened-block position with a committed-record
+state. The primary and target catalogs must both show the target in `AUTOMATIC`
+mode. It never compares a hardened-block position with a committed-record
 position or narrows native progress to `i64`.
 
 ### Reseed
@@ -222,19 +239,28 @@ tests alone. Real native interoperability, crash/fault injection and the stage 4
 fencing provider remain release gates before this can be described as a
 production HA implementation.
 
-### Current live-validation blocker
+### Live-validation constraints
 
 A three-instance SQL Server 2022 Developer pilot exposed a fresh-join ordering
-problem. `JOIN` can start automatic seeding before the adapter dispatches the
+problem: `JOIN` can start automatic seeding before the adapter dispatches the
 target's `GRANT CREATE ANY DATABASE`. SQL Server then reports automatic-seeding
-state `FAILED`, failure state `3` (`Request Denied`). The planner's fail-closed
-seeding check runs before the grant/trigger actions, so that failure blocks the
-actions needed to continue. End-to-end seeding and retained seed-result replay
-have not passed this live test.
+state `FAILED`, failure state `3` (`Request Denied`). The staged MANUAL/JOIN/
+grant/AUTOMATIC sequence prevents that eager attempt. Existing failed native
+attempts, including `Request Denied`, remain refusals: this change does not
+erase history, reset a journal, or implicitly authorize a retry or reseed.
 
 The observer also correctly rejects an observation spanning a native
-configuration or role transition. The current opt-in driver aborts on that
-diagnostic rather than retrying it, which can stop the test earlier.
+configuration or role transition. A native physical-seeding row with a not-yet
+initialized (nil) identifier is rejected as malformed. The current opt-in driver
+aborts on these diagnostics rather than retrying them.
+
+The H1 pilot completed both native copies and retained seed-result replay.
+The final combined run passed all five live tests, after earlier invocations
+stopped on those transient observations and resumed the **same retained
+journal**. This is not a clean, single-invocation cold-start result. Both
+secondaries reached `ONLINE`/`SYNCHRONIZED`/`HEALTHY`, and the source reported
+two completed seeding attempts without a failed attempt. Neither the observer's
+failure checks nor the live driver's retry behavior were relaxed for this fix.
 
 The pilot used full-system x86-64 emulation on Apple Silicon, not a supported
 native SQL Server HA deployment. These results do not validate reseed, fencing,

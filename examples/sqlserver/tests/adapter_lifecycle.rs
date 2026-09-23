@@ -9,6 +9,7 @@ use sqlserver_replicated::convergence::{AcceptedAuthority, NativeAction, NodeEvi
 use sqlserver_replicated::instance::unix_millis;
 use sqlserver_replicated::journal::OperationJournal;
 use sqlserver_replicated::mutation::{AgBackend, AuthorizationVerifier};
+use sqlserver_replicated::observation::AutomaticSeedingSnapshot;
 use sqlserver_replicated::runtime_error::RuntimeError;
 use sqlserver_replicated::{
     MutationMode, NativeRole, Observation, ObservationFailureKind, OperationEnvelope,
@@ -19,6 +20,7 @@ struct State {
     effects: Vec<NativeAction>,
     lost_reply: Option<&'static str>,
     hold_seeding: bool,
+    seeding_granted: bool,
     deny: bool,
 }
 
@@ -101,8 +103,34 @@ impl AgBackend for Backend {
         let mut state = self.0.lock().unwrap();
         state.effects.push(action.clone());
         match action {
+            NativeAction::DisableAutomaticSeeding { .. } => {
+                fixtures::group(&mut state.nodes[0]).replicas[1].seeding_mode = "MANUAL".into();
+            }
             NativeAction::JoinAvailabilityGroup { .. } => {
-                state.nodes[1] = fixtures::existing(2, false)
+                let mode = fixtures::group(&mut state.nodes[0]).replicas[1]
+                    .seeding_mode
+                    .clone();
+                state.nodes[1] = fixtures::existing(2, false);
+                fixtures::group(&mut state.nodes[1]).replicas[1].seeding_mode = mode.clone();
+                if mode == "AUTOMATIC" && !state.seeding_granted {
+                    for (node, remote, is_source) in [(0, 102, true), (1, 101, false)] {
+                        fixtures::group(&mut state.nodes[node])
+                            .automatic_seeding
+                            .push(AutomaticSeedingSnapshot {
+                                group_database_id: fixtures::database().group_database_id,
+                                remote_replica_id: fixtures::guid(remote),
+                                operation_id: fixtures::guid(500),
+                                is_source,
+                                current_state: Some("FAILED".into()),
+                                performed_seeding: Some(false),
+                                failure_state: Some(3),
+                                error_code: None,
+                                number_of_attempts: Some(1),
+                                start_time: Some("2026-08-01T10:00:00".into()),
+                                completion_time: Some("2026-08-01T10:00:01".into()),
+                            });
+                    }
+                }
             }
             NativeAction::DetachDatabase { .. } => {
                 let mut probe = fixtures::database_probe(&mut state.nodes[1]).clone();
@@ -114,13 +142,24 @@ impl AgBackend for Backend {
             NativeAction::DropDatabase { .. } => {
                 fixtures::install_database(&mut state.nodes[1], 2, None)
             }
-            NativeAction::GrantSeeding { .. } => {}
-            NativeAction::TriggerSeeding { .. } if !state.hold_seeding => {
-                let mut replacement = fixtures::probe(2, true);
-                replacement.database_guid = fixtures::guid(902);
-                fixtures::install_database(&mut state.nodes[1], 2, Some(replacement));
+            NativeAction::GrantSeeding { .. } => {
+                assert_eq!(
+                    fixtures::group(&mut state.nodes[1]).local_replica.role,
+                    Some(NativeRole::Secondary)
+                );
+                state.seeding_granted = true;
             }
-            NativeAction::TriggerSeeding { .. } => {}
+            NativeAction::TriggerSeeding { .. } => {
+                assert!(state.seeding_granted, "copy must not precede permission");
+                for node in &mut state.nodes[..2] {
+                    fixtures::group(node).replicas[1].seeding_mode = "AUTOMATIC".into();
+                }
+                if !state.hold_seeding {
+                    let mut replacement = fixtures::probe(2, true);
+                    replacement.database_guid = fixtures::guid(902);
+                    fixtures::install_database(&mut state.nodes[1], 2, Some(replacement));
+                }
+            }
             other => panic!("unexpected fixture action: {other:?}"),
         }
         if state.lost_reply == Some(action.key()) {
@@ -151,6 +190,7 @@ fn state(nodes: Vec<NodeEvidence>) -> Arc<Mutex<State>> {
         effects: Vec::new(),
         lost_reply: None,
         hold_seeding: false,
+        seeding_granted: false,
         deny: false,
     }))
 }
@@ -161,14 +201,18 @@ async fn joining_is_prepared_then_confirmed_by_native_identity_not_ack() {
     let directory = tempfile::tempdir().unwrap();
     let state = state(nodes);
     let mut adapter = enabled(&directory.path().join("journal"), &authority, state.clone());
-    assert!(matches!(
-        adapter.reconcile(&request, &authority).await.unwrap(),
-        AdapterOutcome::Prepared(NativeAction::JoinAvailabilityGroup { .. })
-    ));
-    assert!(matches!(
-        adapter.reconcile(&request, &authority).await.unwrap(),
-        AdapterOutcome::Dispatched(_)
-    ));
+    for key in ["disable_automatic_seeding", "join_availability_group"] {
+        let AdapterOutcome::Prepared(action) =
+            adapter.reconcile(&request, &authority).await.unwrap()
+        else {
+            panic!("expected preparation")
+        };
+        assert_eq!(action.key(), key);
+        assert!(matches!(
+            adapter.reconcile(&request, &authority).await.unwrap(),
+            AdapterOutcome::Dispatched(_)
+        ));
+    }
     assert!(
         adapter
             .journal()
@@ -182,6 +226,135 @@ async fn joining_is_prepared_then_confirmed_by_native_identity_not_ack() {
         adapter.reconcile(&request, &authority).await.unwrap(),
         AdapterOutcome::Complete { .. }
     ));
+    assert_eq!(state.lock().unwrap().effects.len(), 2);
+}
+
+#[tokio::test]
+async fn initial_seeding_survives_a_lost_disable_or_join_reply_without_request_denied() {
+    for lost_reply in ["disable_automatic_seeding", "join_availability_group"] {
+        let (join, authority, nodes) = fixtures::join(unix_millis().unwrap());
+        let (seed, _, _) = fixtures::seed(unix_millis().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal");
+        let state = state(nodes);
+        state.lock().unwrap().lost_reply = Some(lost_reply);
+        let mut adapter = enabled(&path, &authority, state.clone());
+        for request in [&join, &seed] {
+            let mut completed = false;
+            for _ in 0..12 {
+                let before = state.lock().unwrap().effects.len();
+                match adapter.reconcile(request, &authority).await {
+                    Ok(AdapterOutcome::Complete { .. }) => {
+                        completed = true;
+                        break;
+                    }
+                    Ok(AdapterOutcome::Prepared(_) | AdapterOutcome::Dispatched(_)) => {}
+                    Err(sqlserver_replicated::adapter::AdapterError::Runtime(error))
+                        if error.kind == ObservationFailureKind::TimedOut =>
+                    {
+                        drop(adapter);
+                        adapter = enabled(&path, &authority, state.clone());
+                    }
+                    other => panic!("unexpected initial seeding outcome: {other:?}"),
+                }
+                assert!(state.lock().unwrap().effects.len() <= before + 1);
+            }
+            assert!(completed);
+        }
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .effects
+                .iter()
+                .map(NativeAction::key)
+                .collect::<Vec<_>>(),
+            [
+                "disable_automatic_seeding",
+                "join_availability_group",
+                "grant_seeding",
+                "trigger_seeding"
+            ]
+        );
+        for node in &mut state.lock().unwrap().nodes[..2] {
+            assert!(fixtures::group(node).automatic_seeding.is_empty());
+            assert_eq!(fixtures::group(node).replicas[1].seeding_mode, "AUTOMATIC");
+        }
+        assert!(matches!(
+            adapter.reconcile(&seed, &authority).await.unwrap(),
+            AdapterOutcome::Complete { replayed: true, .. }
+        ));
+        assert_eq!(state.lock().unwrap().effects.len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn existing_uncertain_join_intent_cannot_be_reordered_behind_a_new_disable() {
+    let (join, authority, mut nodes) = fixtures::join(unix_millis().unwrap());
+    fixtures::group(&mut nodes[0]).replicas[1].seeding_mode = "MANUAL".into();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal");
+    let state = state(nodes);
+    let mut adapter = enabled(&path, &authority, state.clone());
+    assert!(matches!(
+        adapter.reconcile(&join, &authority).await.unwrap(),
+        AdapterOutcome::Prepared(NativeAction::JoinAvailabilityGroup { .. })
+    ));
+    drop(adapter);
+    fixtures::group(&mut state.lock().unwrap().nodes[0]).replicas[1].seeding_mode =
+        "AUTOMATIC".into();
+    let mut adapter = enabled(&path, &authority, state.clone());
+    assert!(matches!(
+        adapter.reconcile(&join, &authority).await.unwrap(),
+        AdapterOutcome::Unsafe(_)
+    ));
+    let entry = adapter
+        .journal()
+        .entry(join.operation_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.actions.len(), 1);
+    assert_eq!(entry.actions[0].action_key, "join_availability_group");
+    assert!(!entry.actions[0].acknowledged);
+    assert!(state.lock().unwrap().effects.is_empty());
+    state.lock().unwrap().nodes[1] = fixtures::existing(2, false);
+    assert!(matches!(
+        adapter.reconcile(&join, &authority).await.unwrap(),
+        AdapterOutcome::Complete {
+            replayed: false,
+            ..
+        }
+    ));
+    assert!(state.lock().unwrap().effects.is_empty());
+}
+
+#[tokio::test]
+async fn eager_join_without_the_manual_stage_reproduces_request_denied() {
+    let (join, authority, nodes) = fixtures::join(unix_millis().unwrap());
+    let state = state(nodes);
+    Backend(state.clone())
+        .execute(
+            &join,
+            &authority,
+            &NativeAction::JoinAvailabilityGroup {
+                availability_group: fixtures::ag(),
+                target: fixtures::observed(2),
+            },
+            &Verifier(state.clone()),
+        )
+        .await
+        .unwrap();
+    let (seed, _, _) = fixtures::seed(unix_millis().unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let mut adapter = enabled(&directory.path().join("journal"), &authority, state.clone());
+    assert!(matches!(
+        adapter.reconcile(&seed, &authority).await.unwrap(),
+        AdapterOutcome::Unsafe("native automatic seeding reports a failure")
+    ));
+    assert_eq!(
+        fixtures::group(&mut state.lock().unwrap().nodes[0]).automatic_seeding[0].failure_state,
+        Some(3)
+    );
     assert_eq!(state.lock().unwrap().effects.len(), 1);
 }
 

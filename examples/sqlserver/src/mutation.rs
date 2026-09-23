@@ -544,6 +544,30 @@ pub(crate) fn validate_action(
                 availability_group,
                 target,
             },
+            NativeAction::DisableAutomaticSeeding {
+                availability_group: actual_group,
+                source,
+                target: actual_target,
+                target_server_name,
+            },
+        ) => {
+            availability_group == actual_group
+                && target == actual_target
+                && source.logical_id() == authority.primary.logical_id()
+                && source.incarnation() == authority.primary.incarnation()
+                && source.native_replica_id().is_some()
+                && source.native_replica_id() != target.native_replica_id()
+                && authority.replicas.iter().any(|replica| {
+                    replica.identity.logical_id() == target.logical_id()
+                        && replica.identity.incarnation() == target.incarnation()
+                        && replica.server_name == *target_server_name
+                })
+        }
+        (
+            OperationPayload::EnsureReplicaJoined {
+                availability_group,
+                target,
+            },
             NativeAction::JoinAvailabilityGroup {
                 availability_group: actual_group,
                 target: actual_target,
@@ -901,6 +925,19 @@ fn database_guard(
     ))
 }
 
+fn target_replica_guard(
+    group: &AvailabilityGroupIdentity,
+    target: &ReplicaIdentity,
+    server: &ServerName,
+) -> Result<String, RuntimeError> {
+    Ok(format!(
+        "IF NOT EXISTS (SELECT 1 FROM sys.availability_replicas WHERE group_id = {} AND replica_id = {} AND UPPER(replica_server_name) = UPPER({}) AND availability_mode = 1 AND failover_mode = 2 AND seeding_mode IN (0, 1)) THROW 51000, 'Native seed target changed', 1;\n",
+        literal(group.group_id.as_str()),
+        literal(require_native(target)?.as_str()),
+        literal(server.as_str())
+    ))
+}
+
 fn old_database_guard(
     name: &SqlIdentifier,
     database_id: u32,
@@ -971,6 +1008,23 @@ fn render_action(
                 name.quoted(), database_name.quoted()
             ));
         }
+        NativeAction::DisableAutomaticSeeding {
+            availability_group: group,
+            source,
+            target,
+            target_server_name,
+        } => {
+            body.push_str(&group_guard(group));
+            body.push_str(&role_guard(group, source, "PRIMARY")?);
+            body.push_str(&target_replica_guard(group, target, target_server_name)?);
+            body.push_str(&format!(
+                "IF EXISTS (SELECT 1 FROM sys.dm_hadr_automatic_seeding WHERE ag_id = {} AND ag_remote_replica_id = {} AND (current_state IS NULL OR current_state NOT IN (N'COMPLETED', N'FAILED'))) THROW 51000, 'Automatic seeding is active or unknown; reobserve', 1;\n\
+                 IF EXISTS (SELECT 1 FROM sys.dm_hadr_physical_seeding_stats AS s INNER JOIN sys.databases AS d ON d.database_id = s.local_database_id INNER JOIN sys.availability_databases_cluster AS adc ON adc.group_database_id = d.group_database_id WHERE adc.group_id = {} AND s.end_time_utc IS NULL) THROW 51000, 'Physical seeding is active; reobserve', 1;\n\
+                 ALTER AVAILABILITY GROUP {} MODIFY REPLICA ON {} WITH (SEEDING_MODE = MANUAL);\n",
+                literal(group.group_id.as_str()), literal(require_native(target)?.as_str()),
+                literal(group.group_id.as_str()), group.name.quoted(), literal(target_server_name.as_str())
+            ));
+        }
         NativeAction::JoinAvailabilityGroup {
             availability_group: group,
             target,
@@ -1009,12 +1063,12 @@ fn render_action(
             body.push_str(&group_guard(group));
             body.push_str(&role_guard(group, source, "PRIMARY")?);
             body.push_str(&database_guard(database, source)?);
+            body.push_str(&target_replica_guard(group, target, target_server_name)?);
             let target_id = literal(require_native(target)?.as_str());
             body.push_str(&format!(
-                "IF NOT EXISTS (SELECT 1 FROM sys.availability_replicas WHERE group_id = {} AND replica_id = {target_id} AND UPPER(replica_server_name) = UPPER({}) AND availability_mode = 1 AND failover_mode = 2) THROW 51000, 'Native seed target changed', 1;\n\
-                 IF NOT EXISTS (SELECT 1 FROM sys.dm_hadr_automatic_seeding WHERE ag_id = {} AND ag_db_id = {} AND ag_remote_replica_id = {target_id} AND current_state IN (N'PENDING', N'IN_PROGRESS'))\n\
+                "IF NOT EXISTS (SELECT 1 FROM sys.dm_hadr_automatic_seeding WHERE ag_id = {} AND ag_db_id = {} AND ag_remote_replica_id = {target_id} AND current_state IN (N'PENDING', N'IN_PROGRESS'))\n\
                  BEGIN ALTER AVAILABILITY GROUP {} MODIFY REPLICA ON {} WITH (SEEDING_MODE = AUTOMATIC); END;\n",
-                literal(group.group_id.as_str()), literal(target_server_name.as_str()), literal(group.group_id.as_str()),
+                literal(group.group_id.as_str()),
                 literal(database.group_database_id.as_str()), group.name.quoted(), literal(target_server_name.as_str())
             ));
         }
@@ -1400,6 +1454,94 @@ mod tests {
         assert!(sql.contains("d.recovery_model_desc = N'FULL'"));
         assert!(sql.contains("r.last_log_backup_lsn > 0"));
         assert!(!sql.contains("DROP "));
+    }
+
+    #[test]
+    fn disabling_automatic_seeding_is_bound_to_the_join_and_accepted_primary() {
+        let request = OperationEnvelope::new(
+            OperationRequest::new(
+                "resource",
+                "join",
+                "configuration",
+                1,
+                1,
+                OperationPayload::EnsureReplicaJoined {
+                    availability_group: group(),
+                    target: replica(1),
+                },
+            )
+            .unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let action = NativeAction::DisableAutomaticSeeding {
+            availability_group: group(),
+            source: replica(0),
+            target: replica(1),
+            target_server_name: ServerName::new("sql-1").unwrap(),
+        };
+        validate_action(&request, &authority(), &action).unwrap();
+        assert!(validate_action(&reseed(), &authority(), &action).is_err());
+        for change in 0..7 {
+            let mut changed = action.clone();
+            let NativeAction::DisableAutomaticSeeding {
+                availability_group,
+                source,
+                target,
+                target_server_name,
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            match change {
+                0 => availability_group.group_id = guid(999),
+                1 => *source = replica(2),
+                2 => *source = authority().primary,
+                3 => *source = ReplicaIdentity::observed("replica-0", guid(10), "old-pod").unwrap(),
+                4 => *target = replica(2),
+                5 => *target_server_name = ServerName::new("foreign-server").unwrap(),
+                6 => *source = ReplicaIdentity::observed("replica-0", guid(11), "pod-0").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(validate_action(&request, &authority(), &changed).is_err());
+        }
+    }
+
+    #[test]
+    fn manual_seeding_is_one_primary_effect_guarded_against_active_copy() {
+        let action = NativeAction::DisableAutomaticSeeding {
+            availability_group: group(),
+            source: replica(0),
+            target: replica(1),
+            target_server_name: ServerName::new("sql-1").unwrap(),
+        };
+        let sql = render_action(
+            &action,
+            &ServerName::new("sql-0").unwrap(),
+            &database().name,
+            5022,
+        )
+        .unwrap();
+        let mutation = sql.find("ALTER AVAILABILITY GROUP ").unwrap();
+        for guard in [
+            "cluster_type = 2",
+            "role_desc = N'PRIMARY'",
+            "Native seed target changed",
+            "seeding_mode IN (0, 1)",
+            "current_state IS NULL OR current_state NOT IN (N'COMPLETED', N'FAILED')",
+            "ag_remote_replica_id",
+            "s.end_time_utc IS NULL",
+        ] {
+            assert!(sql[..mutation].contains(guard), "missing guard: {guard}");
+        }
+        assert!(sql.contains(
+            "ALTER AVAILABILITY GROUP [group] MODIFY REPLICA ON N'sql-1' WITH (SEEDING_MODE = MANUAL)"
+        ));
+        assert_eq!(sql.matches("ALTER AVAILABILITY GROUP ").count(), 1);
+        assert!(!sql.contains(" JOIN WITH "));
+        assert!(!sql.contains("GRANT CREATE ANY DATABASE"));
+        assert!(!sql.contains("DROP DATABASE"));
     }
 
     #[test]

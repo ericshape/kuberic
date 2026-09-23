@@ -104,6 +104,14 @@ An EXTERNAL AG must report numeric cluster type `2` and an ASCII
 case-insensitive `EXTERNAL` descriptor, including SQL Server's lowercase
 `external` value. The original native descriptor is preserved in the snapshot.
 
+Replica seeding metadata accepts the exact native pairs `0`/`AUTOMATIC` and
+`1`/`MANUAL`. The latter allows the convergence adapter to observe a secondary's
+temporary disabled-seeding state before JOIN and the database-creation grant.
+A native primary in `MANUAL` mode, mismatched numeric/descriptor pairs, and
+unknown modes remain unsupported. Observing `MANUAL` does not establish
+replica health or seeding completion; the desired profile remains automatic
+seeding.
+
 ## Evidence and output
 
 One-shot mode emits one JSON document. Watch mode emits newline-delimited JSON

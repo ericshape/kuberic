@@ -259,6 +259,18 @@ impl<B: AgBackend, V: AuthorizationVerifier> AgAdapter<B, V> {
                         "an equivalent retained effect has no proven current postcondition; explicit new intent is required",
                     ));
                 }
+                if matches!(&action, NativeAction::DisableAutomaticSeeding { .. })
+                    && exact.is_some_and(|entry| {
+                        entry
+                            .actions
+                            .iter()
+                            .any(|intent| intent.action_key == "join_availability_group")
+                    })
+                {
+                    return Ok(AdapterOutcome::Unsafe(
+                        "a JOIN intent already exists; automatic seeding cannot be disabled while its outcome is uncertain",
+                    ));
+                }
                 let action = canonical_action(action);
                 validate_action(envelope, authority, &action)?;
                 let payload = encode_action(&action)?;

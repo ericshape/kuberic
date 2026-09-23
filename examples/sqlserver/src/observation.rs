@@ -630,10 +630,13 @@ fn parse_replicas(
                 "only EXTERNAL replica failover mode is supported",
             ));
         }
-        if row.unsigned::<u8>("seeding_mode")? != 0 || seeding_mode != "AUTOMATIC" {
+        if !matches!(
+            (row.unsigned::<u8>("seeding_mode")?, seeding_mode.as_str()),
+            (0, "AUTOMATIC") | (1, "MANUAL")
+        ) {
             return Err(unsupported(
                 row.stage,
-                "only automatic seeding configuration is supported",
+                "unsupported or mismatched native seeding mode",
             ));
         }
         if server_name == anchor.instance.server_name {
@@ -685,6 +688,16 @@ fn parse_replicas(
             }
             _ => return Err(malformed(row.stage, "partial replica state identity")),
         };
+        if seeding_mode == "MANUAL"
+            && state
+                .as_ref()
+                .is_some_and(|state| state.role == Some(NativeRole::Primary))
+        {
+            return Err(unsupported(
+                row.stage,
+                "the native primary must use automatic seeding mode",
+            ));
+        }
         replicas.insert(
             replica_id.clone(),
             ReplicaSnapshot {

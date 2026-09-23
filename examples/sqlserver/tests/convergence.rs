@@ -475,8 +475,32 @@ fn duplicate_or_inconsistent_native_guids_endpoints_and_group_ids_are_refused() 
 }
 
 #[test]
+fn fresh_join_disables_eager_automatic_seeding_before_joining_the_target() {
+    let mut nodes = seed_nodes();
+    snapshot(&mut nodes[1]).availability_group = absent();
+    let disable = action(
+        decide(join_payload(), &nodes, &[]),
+        "disable_automatic_seeding",
+    );
+    assert_eq!(disable.execution_target(), &observed(1));
+    assert!(!disable.is_destructive());
+    wait(decide(
+        join_payload(),
+        &nodes,
+        &["disable_automatic_seeding"],
+    ));
+    group(&mut nodes[0]).replicas[1].seeding_mode = "MANUAL".into();
+    let join = action(
+        decide(join_payload(), &nodes, &["disable_automatic_seeding"]),
+        "join_availability_group",
+    );
+    assert_eq!(join.execution_target(), &observed(2));
+}
+
+#[test]
 fn join_requires_source_catalog_native_identity_and_allows_fresh_absent_target_discovery() {
     let mut nodes = seed_nodes();
+    group(&mut nodes[0]).replicas[1].seeding_mode = "MANUAL".into();
     set_role(&mut nodes[1], None);
     let join = action(
         decide(join_payload(), &nodes, &[]),
@@ -508,6 +532,80 @@ fn join_completes_from_fresh_secondary_identity_without_command_acknowledgment()
     assert_eq!(result.availability_group, ag());
     assert_eq!(result.database, None);
     assert_eq!(result.database_guid, None);
+}
+
+#[test]
+fn join_does_not_stop_active_seeding_or_bypass_unknown_or_failed_attempts() {
+    for state in [Some("PENDING"), Some("IN_PROGRESS"), Some("FUTURE"), None] {
+        let mut nodes = seed_nodes();
+        snapshot(&mut nodes[1]).availability_group = absent();
+        group(&mut nodes[0])
+            .automatic_seeding
+            .push(automatic(500, state, true));
+        wait(decide(join_payload(), &nodes, &[]));
+    }
+    let mut nodes = seed_nodes();
+    snapshot(&mut nodes[1]).availability_group = absent();
+    group(&mut nodes[0])
+        .automatic_seeding
+        .push(automatic(500, Some("FAILED"), true));
+    unsafe_decision(decide(join_payload(), &nodes, &[]));
+    group(&mut nodes[0]).automatic_seeding.clear();
+    group(&mut nodes[0]).physical_seeding.push(physical());
+    wait(decide(join_payload(), &nodes, &[]));
+    group(&mut nodes[0]).physical_seeding[0].failure_code = Some(1);
+    unsafe_decision(decide(join_payload(), &nodes, &[]));
+}
+
+#[test]
+fn secondary_manual_seeding_is_transitional_not_a_synchronized_postcondition() {
+    for node in [0, 1] {
+        let mut nodes = seed_nodes();
+        install_database(&mut nodes[1], 2, Some(probe(2, true)));
+        group(&mut nodes[node]).replicas[1].seeding_mode = "MANUAL".into();
+        wait(decide(
+            seed_payload(),
+            &nodes,
+            &["grant_seeding", "trigger_seeding"],
+        ));
+        group(&mut nodes[node]).replicas[1].seeding_mode = "AUTOMATIC".into();
+        assert!(matches!(
+            decide(seed_payload(), &nodes, &[]),
+            Decision::Complete(_)
+        ));
+    }
+    let mut nodes = seed_nodes();
+    for node in &mut nodes {
+        group(node).replicas[1].seeding_mode = "MANUAL".into();
+    }
+    action(decide(seed_payload(), &nodes, &[]), "grant_seeding");
+    action(
+        decide(seed_payload(), &nodes, &["grant_seeding"]),
+        "trigger_seeding",
+    );
+    group(&mut nodes[0]).replicas[1].seeding_mode = "UNKNOWN".into();
+    unsafe_decision(decide(seed_payload(), &nodes, &[]));
+}
+
+#[test]
+fn request_denied_history_is_not_ignored_to_allow_a_grant_or_retry() {
+    for source in [true, false] {
+        let mut nodes = seed_nodes();
+        let mut denied = automatic(500, Some("FAILED"), source);
+        denied.failure_state = Some(3);
+        denied.error_code = None;
+        denied.performed_seeding = Some(false);
+        group(&mut nodes[usize::from(!source)])
+            .automatic_seeding
+            .push(denied);
+        for keys in [
+            &[][..],
+            &["grant_seeding"][..],
+            &["grant_seeding", "trigger_seeding"][..],
+        ] {
+            unsafe_decision(decide(seed_payload(), &nodes, keys));
+        }
+    }
 }
 
 #[test]
@@ -1161,7 +1259,7 @@ fn absent_target_join_still_requires_primary_role_complete_topology_and_bound_en
     snapshot(&mut nodes[1]).availability_group = absent();
     action(
         decide(join_payload(), &nodes, &[]),
-        "join_availability_group",
+        "disable_automatic_seeding",
     );
     let mut missing_primary = nodes.clone();
     snapshot(&mut missing_primary[0]).availability_group = absent();
@@ -1186,7 +1284,7 @@ fn absent_or_unexpected_join_postconditions_never_enable_seeding_or_grants() {
     snapshot(&mut nodes[1]).availability_group = absent();
     action(
         decide(join_payload(), &nodes, &[]),
-        "join_availability_group",
+        "disable_automatic_seeding",
     );
     wait(decide(join_payload(), &nodes, &["join_availability_group"]));
     wait(decide(seed_payload(), &nodes, &[]));
@@ -1299,7 +1397,10 @@ fn shared_scenario_fixtures_bind_all_observation_timestamps_and_expected_first_a
             fixtures::bootstrap as FixtureBuilder,
             "create_availability_group",
         ),
-        (fixtures::join as FixtureBuilder, "join_availability_group"),
+        (
+            fixtures::join as FixtureBuilder,
+            "disable_automatic_seeding",
+        ),
         (fixtures::seed as FixtureBuilder, "grant_seeding"),
         (fixtures::reseed as FixtureBuilder, "detach_database"),
     ];

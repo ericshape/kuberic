@@ -193,6 +193,12 @@ pub enum NativeAction {
         expected_database_guid: Guid,
         expected_recovery_fork_id: Guid,
     },
+    DisableAutomaticSeeding {
+        availability_group: AvailabilityGroupIdentity,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        target_server_name: ServerName,
+    },
     /// The target's local catalog may be absent. The executor must authorize
     /// the name-to-GUID binding and verify both native GUIDs after JOIN before
     /// acknowledging this action.
@@ -233,6 +239,7 @@ impl NativeAction {
     pub const fn key(&self) -> &'static str {
         match self {
             Self::CreateAvailabilityGroup { .. } => "create_availability_group",
+            Self::DisableAutomaticSeeding { .. } => "disable_automatic_seeding",
             Self::JoinAvailabilityGroup { .. } => "join_availability_group",
             Self::GrantSeeding { .. } => "grant_seeding",
             Self::TriggerSeeding { .. } => "trigger_seeding",
@@ -244,7 +251,9 @@ impl NativeAction {
     pub fn execution_target(&self) -> &ReplicaIdentity {
         match self {
             Self::CreateAvailabilityGroup { primary, .. } => primary,
-            Self::TriggerSeeding { source, .. } => source,
+            Self::DisableAutomaticSeeding { source, .. } | Self::TriggerSeeding { source, .. } => {
+                source
+            }
             Self::JoinAvailabilityGroup { target, .. }
             | Self::GrantSeeding { target, .. }
             | Self::DetachDatabase { target, .. }
@@ -353,31 +362,57 @@ fn plan_checked(
         } => {
             let source_group = primary_group(primary)?;
             full_topology(source_group, authority)?;
-            native_target(source_group, authority, target)?;
+            let replica = native_target(source_group, authority, target)?;
             let target_node = node(&nodes, target)?;
+            if target_node.group.is_some() {
+                let target_group = target_group(target_node, target)?;
+                match &target_group.local_replica.role {
+                    Some(NativeRole::Secondary) => {
+                        return Ok(Decision::Complete(postcondition(
+                            availability_group,
+                            None,
+                            target,
+                            None,
+                        )));
+                    }
+                    Some(NativeRole::Primary) => {
+                        return Err(Blocked::Unsafe("join target is a native primary"));
+                    }
+                    Some(NativeRole::Unknown(_)) => {
+                        return Err(Blocked::Wait("join target has an unknown native role"));
+                    }
+                    _ => {}
+                }
+            }
             let join = NativeAction::JoinAvailabilityGroup {
                 availability_group: availability_group.clone(),
                 target: target.clone(),
             };
-            if target_node.group.is_none() {
+            if acknowledged.contains(join.key()) {
                 return Ok(execute_once(join, acknowledged));
             }
-            let target_group = target_group(target_node, target)?;
-            match &target_group.local_replica.role {
-                Some(NativeRole::Secondary) => Ok(Decision::Complete(postcondition(
-                    availability_group,
-                    None,
-                    target,
-                    None,
-                ))),
-                Some(NativeRole::Primary) => {
-                    Err(Blocked::Unsafe("join target is a native primary"))
-                }
-                Some(NativeRole::Unknown(_)) => {
-                    Err(Blocked::Wait("join target has an unknown native role"))
-                }
-                _ => Ok(execute_once(join, acknowledged)),
+            for database in &source_group.databases {
+                seeding_barrier_on(
+                    &database.identity.group_database_id,
+                    std::iter::once((source_group, target, true)).chain(
+                        target_node
+                            .group
+                            .map(|group| (group, &source_group.local_replica.identity, false)),
+                    ),
+                )?;
             }
+            if replica.seeding_mode == "AUTOMATIC" {
+                return Ok(execute_once(
+                    NativeAction::DisableAutomaticSeeding {
+                        availability_group: availability_group.clone(),
+                        source: source_group.local_replica.identity.clone(),
+                        target: target.clone(),
+                        target_server_name: replica.server_name.clone(),
+                    },
+                    acknowledged,
+                ));
+            }
+            Ok(execute_once(join, acknowledged))
         }
         OperationPayload::EnsureReplicaSeeded {
             availability_group,
@@ -653,7 +688,8 @@ fn check_group(
         }
         if replica.availability_mode != "SYNCHRONOUS_COMMIT"
             || replica.failover_mode != "EXTERNAL"
-            || replica.seeding_mode != "AUTOMATIC"
+            || !matches!(replica.seeding_mode.as_str(), "AUTOMATIC" | "MANUAL")
+            || (member.identity == authority.primary && replica.seeding_mode != "AUTOMATIC")
         {
             return Err(Blocked::Unsafe(
                 "native replica configuration is unsupported",
@@ -1155,16 +1191,26 @@ fn seeding_actions(context: &SeedContext<'_>, acknowledged: &BTreeSet<String>) -
 }
 
 fn seeding_barrier(context: &SeedContext<'_>) -> Check<()> {
+    seeding_barrier_on(
+        &context.database.group_database_id,
+        [
+            (context.primary_group, context.target, true),
+            (context.target_group, context.source, false),
+        ],
+    )
+}
+
+fn seeding_barrier_on<'a>(
+    group_database_id: &Guid,
+    nodes: impl IntoIterator<Item = (&'a AvailabilityGroupSnapshot, &'a ReplicaIdentity, bool)>,
+) -> Check<()> {
     let mut pending = None;
-    for (group, remote, is_source) in [
-        (context.primary_group, context.target, true),
-        (context.target_group, context.source, false),
-    ] {
+    for (group, remote, is_source) in nodes {
         let relevant: Vec<_> = group
             .automatic_seeding
             .iter()
             .filter(|seed| {
-                seed.group_database_id == context.database.group_database_id
+                &seed.group_database_id == group_database_id
                     && Some(&seed.remote_replica_id) == remote.native_replica_id()
                     && seed.is_source == is_source
             })
@@ -1200,7 +1246,7 @@ fn seeding_barrier(context: &SeedContext<'_>) -> Check<()> {
         for seed in group
             .physical_seeding
             .iter()
-            .filter(|seed| seed.group_database_id == context.database.group_database_id)
+            .filter(|seed| &seed.group_database_id == group_database_id)
         {
             if seed.failure_code.is_some_and(|code| code != 0) {
                 return Err(Blocked::Unsafe(
@@ -1223,7 +1269,15 @@ fn seeding_barrier(context: &SeedContext<'_>) -> Check<()> {
 }
 
 fn synchronized_target(context: &SeedContext<'_>, probe: &DatabaseProbe) -> bool {
-    if probe.name != context.database.name
+    if [context.primary_group, context.target_group]
+        .iter()
+        .any(|group| {
+            !group.replicas.iter().any(|replica| {
+                Some(&replica.replica_id) == context.target.native_replica_id()
+                    && replica.seeding_mode == "AUTOMATIC"
+            })
+        })
+        || probe.name != context.database.name
         || probe.state != "ONLINE"
         || probe.recovery_model != "FULL"
         || probe.group_database_id.as_ref() != Some(&context.database.group_database_id)
@@ -1387,20 +1441,21 @@ fn native_catalog_member<'a>(
         ))
 }
 
-fn native_target(
-    group: &AvailabilityGroupSnapshot,
+fn native_target<'a>(
+    group: &'a AvailabilityGroupSnapshot,
     authority: &AcceptedAuthority,
     target: &ReplicaIdentity,
-) -> Check<()> {
+) -> Check<&'a ReplicaSnapshot> {
     let member = authority
         .member(target)
         .ok_or(Blocked::Unsafe("target is not an accepted member"))?;
-    if Some(&native_catalog_member(group, member)?.replica_id) != target.native_replica_id() {
+    let replica = native_catalog_member(group, member)?;
+    if Some(&replica.replica_id) != target.native_replica_id() {
         return Err(Blocked::Unsafe(
             "target native replica GUID differs from the primary catalog",
         ));
     }
-    Ok(())
+    Ok(replica)
 }
 
 fn node<'a, 'b>(
@@ -1428,7 +1483,9 @@ fn fresh<T>(observation: &Observation<T>, now: u64, max_age: u64) -> Check<Optio
 fn check_acknowledgments(payload: &OperationPayload, acknowledged: &BTreeSet<String>) -> Check<()> {
     let allowed: &[&str] = match payload {
         OperationPayload::EnsureAvailabilityGroup { .. } => &["create_availability_group"],
-        OperationPayload::EnsureReplicaJoined { .. } => &["join_availability_group"],
+        OperationPayload::EnsureReplicaJoined { .. } => {
+            &["disable_automatic_seeding", "join_availability_group"]
+        }
         OperationPayload::EnsureReplicaSeeded { .. } => &["grant_seeding", "trigger_seeding"],
         OperationPayload::ReseedReplica { .. } => &[
             "detach_database",
