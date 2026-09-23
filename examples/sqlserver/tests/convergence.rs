@@ -184,6 +184,31 @@ fn existing_bootstrap_completion_requires_exact_native_topology_and_managed_data
 }
 
 #[test]
+fn native_cluster_type_descriptors_accept_ascii_casing() {
+    for descriptor in ["external", "EXTERNAL", "ExTeRnAl"] {
+        let mut nodes = seed_nodes();
+        for node in &mut nodes {
+            group(node).cluster_type = descriptor.into();
+        }
+        let decision = decide(bootstrap_payload(Some(guid(10))), &nodes, &[]);
+        let Decision::Complete(result) = decision else {
+            panic!("native descriptor {descriptor:?} must complete bootstrap, got {decision:?}");
+        };
+        assert_eq!(result.availability_group, ag());
+        assert_eq!(result.database, Some(database()));
+    }
+}
+
+#[test]
+fn unsupported_cluster_type_descriptors_are_rejected() {
+    for descriptor in ["NONE", "WSFC", "UNKNOWN", "", "external ", " external"] {
+        let mut nodes = seed_nodes();
+        group(&mut nodes[0]).cluster_type = descriptor.into();
+        unsafe_decision(decide(bootstrap_payload(Some(guid(10))), &nodes, &[]));
+    }
+}
+
+#[test]
 fn existing_bootstrap_does_not_adopt_a_foreign_secondary_database() {
     let mut nodes = seed_nodes();
     nodes[1].database = present(probe(2, false));

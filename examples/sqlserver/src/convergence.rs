@@ -600,7 +600,7 @@ fn check_group(
     node: &NodeEvidence,
     authority: &AcceptedAuthority,
 ) -> Check<()> {
-    if group.cluster_type != "EXTERNAL"
+    if !group.cluster_type.eq_ignore_ascii_case("EXTERNAL")
         || group.basic_features
         || group.is_distributed
         || group.required_synchronized_secondaries_to_commit != 1

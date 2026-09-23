@@ -105,6 +105,11 @@ probes. It returns `Complete`, one `Execute` action, `Wait`, or `Unsafe`.
 Failures, unknown metadata, clock skew, stale observations, wrong incarnations
 and incompatible native identities never imply success.
 
+SQL Server can report the native cluster-type descriptor as lowercase
+`external`. The observer still requires numeric `cluster_type = 2`; the planner
+compares the preserved descriptor case-insensitively. Unknown descriptors and
+other unsupported profile settings remain unsafe.
+
 The adapter separates intent preparation from dispatch:
 
 1. Validate the request, authority, and registered instance bindings.
@@ -216,6 +221,26 @@ requested. No live mutation guarantee should be inferred from server-free
 tests alone. Real native interoperability, crash/fault injection and the stage 4
 fencing provider remain release gates before this can be described as a
 production HA implementation.
+
+### Current live-validation blocker
+
+A three-instance SQL Server 2022 Developer pilot exposed a fresh-join ordering
+problem. `JOIN` can start automatic seeding before the adapter dispatches the
+target's `GRANT CREATE ANY DATABASE`. SQL Server then reports automatic-seeding
+state `FAILED`, failure state `3` (`Request Denied`). The planner's fail-closed
+seeding check runs before the grant/trigger actions, so that failure blocks the
+actions needed to continue. End-to-end seeding and retained seed-result replay
+have not passed this live test.
+
+The observer also correctly rejects an observation spanning a native
+configuration or role transition. The current opt-in driver aborts on that
+diagnostic rather than retrying it, which can stop the test earlier.
+
+The pilot used full-system x86-64 emulation on Apple Silicon, not a supported
+native SQL Server HA deployment. These results do not validate reseed, fencing,
+failover, or operator integration. Do not pre-grant seeding permissions, clear
+the journal, or bypass the failure checks to label the adapter-driven test as
+passing.
 
 ### Opt-in laboratory test
 
