@@ -554,6 +554,30 @@ async fn observes_absence_only_after_permissions_capabilities_and_matching_ancho
 }
 
 #[tokio::test]
+async fn external_cluster_descriptors_accept_ascii_casing_and_preserve_native_evidence() {
+    for descriptor in ["external", "EXTERNAL", "ExTeRnAl"] {
+        let mut script = present_script();
+        change_rows(&mut script, ReadQuery::Anchor, |row| {
+            set(row, "cluster_type_desc", Some(descriptor));
+        });
+        let snapshot = success(script).await;
+        assert_eq!(group(&snapshot).cluster_type, descriptor);
+    }
+}
+
+#[tokio::test]
+async fn external_cluster_descriptors_cannot_override_an_unsupported_numeric_type() {
+    for cluster_type in ["0", "1", "3", "255"] {
+        let mut script = present_script();
+        change_rows(&mut script, ReadQuery::Anchor, |row| {
+            set(row, "cluster_type", Some(cluster_type));
+            set(row, "cluster_type_desc", Some("external"));
+        });
+        failure(script, ObservationFailureKind::Unsupported).await;
+    }
+}
+
+#[tokio::test]
 async fn supports_real_developer_and_enterprise_display_names_with_engine_edition_cross_check() {
     for edition in [
         "Developer",
@@ -1351,7 +1375,9 @@ async fn rejects_unsupported_ag_and_replica_configuration_without_inferred_healt
         ("cluster_type", "0"),
         ("cluster_type", "1"),
         ("cluster_type_desc", "NONE"),
+        ("cluster_type_desc", "none"),
         ("cluster_type_desc", "FUTURE_CLUSTER"),
+        ("cluster_type_desc", "external_other"),
         ("required_synchronized_secondaries_to_commit", "0"),
         ("required_synchronized_secondaries_to_commit", "2"),
         ("basic_features", "1"),

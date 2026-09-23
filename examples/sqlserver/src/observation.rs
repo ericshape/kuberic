@@ -416,7 +416,8 @@ impl Anchor {
                     "native availability group name does not match the requested group",
                 ));
             }
-            if group.cluster_type != 2 || group.cluster_type_desc != "EXTERNAL" {
+            if group.cluster_type != 2 || !group.cluster_type_desc.eq_ignore_ascii_case("EXTERNAL")
+            {
                 return Err(unsupported(
                     "anchor",
                     "only EXTERNAL availability groups are supported",

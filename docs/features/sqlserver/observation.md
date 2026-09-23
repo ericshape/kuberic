@@ -100,6 +100,10 @@ An unsupported engine/profile or a changing observation is not. A missing,
 resolving, disconnected, suspended, or unhealthy replica is never synthesized
 into a healthy secondary.
 
+An EXTERNAL AG must report numeric cluster type `2` and an ASCII
+case-insensitive `EXTERNAL` descriptor, including SQL Server's lowercase
+`external` value. The original native descriptor is preserved in the snapshot.
+
 ## Evidence and output
 
 One-shot mode emits one JSON document. Watch mode emits newline-delimited JSON
