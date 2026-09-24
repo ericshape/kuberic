@@ -182,7 +182,8 @@ async fn monitor_publishes_failures_reconnects_and_obeys_poll_interval() {
     receiver.changed().await.unwrap();
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     cancel.cancel();
-    task.await.unwrap().unwrap();
+    let summary = task.await.unwrap().unwrap();
+    assert!(summary.had_failed_or_stale_sample);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -198,7 +199,8 @@ async fn cancellation_drops_an_inflight_observation_without_publishing_success()
     let task = tokio::spawn(async move { monitor.run(sender, task_cancel).await });
     tokio::task::yield_now().await;
     cancel.cancel();
-    task.await.unwrap().unwrap();
+    let summary = task.await.unwrap().unwrap();
+    assert!(!summary.had_failed_or_stale_sample);
     assert!(receiver.borrow().is_none());
 }
 

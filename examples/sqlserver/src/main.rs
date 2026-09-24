@@ -1,11 +1,15 @@
 mod output;
+#[cfg(test)]
+mod watch_tests;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 use output::OutputWriter;
 use sqlserver_replicated::ObservationFailureKind;
+use sqlserver_replicated::executor::SqlExecutor;
 use sqlserver_replicated::instance::{SqlServerInstanceManager, unix_millis};
 use sqlserver_replicated::monitor::{ObservationReport, SqlServerMonitor};
 use sqlserver_replicated::runtime_config::ObserverConfig;
@@ -57,6 +61,19 @@ async fn run(args: Args) -> Result<ExitCode, RuntimeError> {
         };
     }
 
+    run_watch(
+        manager,
+        async |report| output.write(&report).await,
+        shutdown_signal(),
+    )
+    .await
+}
+
+async fn run_watch<E: SqlExecutor + 'static>(
+    manager: SqlServerInstanceManager<E>,
+    mut write: impl AsyncFnMut(ObservationReport) -> Result<(), RuntimeError>,
+    shutdown: impl Future<Output = Result<(), RuntimeError>>,
+) -> Result<ExitCode, RuntimeError> {
     let (publisher, mut receiver) = watch::channel(None);
     let cancellation = CancellationToken::new();
     let monitor_cancellation = cancellation.clone();
@@ -65,11 +82,11 @@ async fn run(args: Args) -> Result<ExitCode, RuntimeError> {
     let mut failed = false;
     let output_result = tokio::select! {
         biased;
-        result = shutdown_signal() => result,
-        result = watch_output(&mut receiver, &output, &mut failed) => result,
+        result = shutdown => result,
+        result = watch_output(&mut receiver, &mut write, &mut failed) => result,
     };
     cancellation.cancel();
-    task.await.map_err(|_| {
+    let summary = task.await.map_err(|_| {
         RuntimeError::new(
             ObservationFailureKind::Unsupported,
             "monitor",
@@ -77,7 +94,7 @@ async fn run(args: Args) -> Result<ExitCode, RuntimeError> {
         )
     })??;
     output_result?;
-    Ok(if failed {
+    Ok(if failed || summary.had_failed_or_stale_sample {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -86,7 +103,7 @@ async fn run(args: Args) -> Result<ExitCode, RuntimeError> {
 
 async fn watch_output(
     receiver: &mut watch::Receiver<Option<ObservationReport>>,
-    output: &OutputWriter,
+    write: &mut impl AsyncFnMut(ObservationReport) -> Result<(), RuntimeError>,
     failed: &mut bool,
 ) -> Result<(), RuntimeError> {
     loop {
@@ -100,7 +117,7 @@ async fn watch_output(
         let report = receiver.borrow_and_update().clone();
         if let Some(report) = report {
             *failed |= !report.fresh;
-            output.write(&report).await?;
+            write(report).await?;
         }
     }
 }

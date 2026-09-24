@@ -61,6 +61,11 @@ impl ObservationReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MonitorSummary {
+    pub had_failed_or_stale_sample: bool,
+}
+
 pub struct SqlServerMonitor<E> {
     manager: SqlServerInstanceManager<E>,
 }
@@ -74,27 +79,86 @@ impl<E: SqlExecutor> SqlServerMonitor<E> {
         &self,
         publisher: watch::Sender<Option<ObservationReport>>,
         cancellation: CancellationToken,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<MonitorSummary, RuntimeError> {
+        let mut summary = MonitorSummary::default();
         loop {
             let observation = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = cancellation.cancelled() => return Ok(summary),
                 result = self.manager.observe() => result?,
             };
             let report = ObservationReport::new(self.manager.config(), observation, unix_millis()?);
-            publisher.send(Some(report)).map_err(|_| {
-                RuntimeError::new(
-                    ObservationFailureKind::Unreachable,
-                    "monitor",
-                    "observation subscriber closed",
-                )
-            })?;
+            publish_report(&publisher, &mut summary, report)?;
             // Delay after each attempt rather than accumulating missed timer ticks.
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = cancellation.cancelled() => return Ok(summary),
                 _ = tokio::time::sleep(self.manager.config().poll_interval()) => {}
             }
+        }
+    }
+}
+
+fn publish_report(
+    publisher: &watch::Sender<Option<ObservationReport>>,
+    summary: &mut MonitorSummary,
+    report: ObservationReport,
+) -> Result<(), RuntimeError> {
+    // Latest-value output can lose reports, but not the monitor's lifetime result.
+    summary.had_failed_or_stale_sample |= !report.fresh;
+    publisher.send(Some(report)).map_err(|_| {
+        RuntimeError::new(
+            ObservationFailureKind::Unreachable,
+            "monitor",
+            "observation subscriber closed",
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_summary_retains_overwritten_failures_and_stale_samples() {
+        let config = ObserverConfig::from_json(include_bytes!("../observer.example.json")).unwrap();
+        let observed_at = 100_000;
+        let now = observed_at + config.max_age_millis() + 1;
+        let stale = ObservationReport::new(
+            &config,
+            Observation::Absent {
+                observed_at_unix_millis: observed_at,
+            },
+            now,
+        );
+        let failed = ObservationReport::new(
+            &config,
+            Observation::Failed(
+                RuntimeError::new(
+                    ObservationFailureKind::PermissionDenied,
+                    "test",
+                    "permission missing",
+                )
+                .into_failure(now),
+            ),
+            now,
+        );
+        let fresh = ObservationReport::new(
+            &config,
+            Observation::Absent {
+                observed_at_unix_millis: now,
+            },
+            now,
+        );
+        assert!(fresh.fresh);
+        for report in [failed, stale] {
+            assert!(!report.fresh);
+            let (publisher, receiver) = watch::channel(None);
+            let mut summary = MonitorSummary::default();
+            publish_report(&publisher, &mut summary, report).unwrap();
+            publish_report(&publisher, &mut summary, fresh.clone()).unwrap();
+            assert_eq!(receiver.borrow().as_ref(), Some(&fresh));
+            assert!(summary.had_failed_or_stale_sample);
         }
     }
 }

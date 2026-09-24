@@ -154,8 +154,11 @@ or durable fencing attestation.
 The CLI exits zero only after a fresh, successful one-shot observation. This
 does not mean the AG is healthy: a valid snapshot can report absence or
 unhealthy replication. Failed/stale attempts exit nonzero. Watch mode keeps
-observing after failures and exits nonzero on shutdown if it emitted any
-failed/stale sample or had one pending for output. SIGINT and SIGTERM cancel
+observing after failures and exits nonzero on shutdown if any report was failed
+or stale at publication, even if a later report overwrote it or shutdown
+prevented its output. The monitor retains this aggregate independently of the
+latest-value output channel. Cancelling an in-flight attempt before it publishes
+does not itself mark watch mode as failed. SIGINT and SIGTERM cancel
 in-flight observation even if the stdout consumer stops reading. Normal writes
 are acknowledged and flushed, but cancellation may leave a partial final JSON
 line. An interrupted one-shot invocation exits with code 130. Output,
@@ -174,7 +177,9 @@ with verified-TLS TDS connections, while `SqlServerInstanceManager` owns
 connection/sample lifecycle and `SqlServerMonitor` publishes complete reports
 through a watch channel. The monitor starts with no sample, supports explicit
 cancellation, and reports subscriber loss rather than silently discarding
-results.
+results. On cancellation, the monitor returns a completion summary recording
+whether any failed/stale report was published. The CLI joins the monitor and
+includes that summary in its exit status without draining blocked output.
 
 The TDS boundary contains panics while polling connection and query futures,
 never reuses a failed or interrupted session, and requires `panic = "unwind"`
