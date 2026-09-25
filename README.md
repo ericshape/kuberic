@@ -95,6 +95,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
 - [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [SQL Server observation](docs/features/sqlserver/observation.md) — observe-only runtime, configuration, and tests
+- [SQL Server convergence](docs/features/sqlserver/convergence.md) — guarded AG lifecycle, operation journal, and authorization boundary
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics

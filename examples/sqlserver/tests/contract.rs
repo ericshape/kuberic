@@ -270,6 +270,7 @@ fn canonical_signature_is_stable_for_replica_set_order() {
         name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
         expected_group_id: None,
         database_name: SqlIdentifier::new("application").unwrap(),
+        primary: desired_replica(1),
         replicas,
     };
     let envelope = OperationEnvelope::new(
@@ -298,7 +299,7 @@ fn canonical_signature_is_stable_for_replica_set_order() {
     assert_eq!(envelope.input_signature(), reordered.input_signature());
     assert_eq!(
         envelope.input_signature().to_string(),
-        "sha256:a1686f50f455aaa8498daa987cd71adec7d145e059f7983a3810053d4c70a970"
+        "sha256:04039d594d217921ed38b381e2d4a308f4068b0d35a3fd688d0e018a7d25ec30"
     );
 }
 
@@ -315,6 +316,7 @@ fn duplicate_replica_identity_is_rejected() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            primary: desired_replica(1),
             replicas: vec![duplicate.clone(), duplicate, descriptor(2)],
         },
     );
@@ -340,6 +342,7 @@ fn bootstrap_uses_desired_identity_before_sql_server_generates_replica_guids() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            primary: desired_replica(1),
             replicas: vec![
                 ReplicaDescriptor {
                     identity: replica(1),
@@ -451,6 +454,9 @@ fn reseed_requires_approval_and_a_fence_for_the_target() {
         OperationPayload::ReseedReplica {
             availability_group: availability_group(),
             database: database(),
+            expected_database_id: 5,
+            expected_database_guid: guid(21),
+            expected_recovery_fork_id: guid(30),
             source: replica(1),
             target: target.clone(),
         },
@@ -479,6 +485,9 @@ fn approval_is_bound_to_canonical_input() {
         OperationPayload::ReseedReplica {
             availability_group: availability_group(),
             database: database(),
+            expected_database_id: 5,
+            expected_database_guid: guid(21),
+            expected_recovery_fork_id: guid(30),
             source: replica(1),
             target: target.clone(),
         },
@@ -490,6 +499,9 @@ fn approval_is_bound_to_canonical_input() {
         OperationPayload::ReseedReplica {
             availability_group: availability_group(),
             database: database(),
+            expected_database_id: 5,
+            expected_database_guid: guid(21),
+            expected_recovery_fork_id: guid(30),
             source: replica(3),
             target: target.clone(),
         },
@@ -771,6 +783,7 @@ fn endpoints_are_dns_canonical_and_duplicate_detection_is_case_insensitive() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            primary: desired_replica(1),
             replicas: vec![
                 ReplicaDescriptor {
                     identity: desired_replica(1),
@@ -822,6 +835,7 @@ fn server_name_case_does_not_change_the_idempotency_key() {
                 name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
                 expected_group_id: None,
                 database_name: SqlIdentifier::new("application").unwrap(),
+                primary: desired_replica(1),
                 replicas: vec![
                     ReplicaDescriptor {
                         identity: desired_replica(1),
@@ -861,6 +875,7 @@ fn server_names_that_differ_only_by_case_are_rejected_as_duplicates() {
             name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
             expected_group_id: None,
             database_name: SqlIdentifier::new("application").unwrap(),
+            primary: desired_replica(1),
             replicas: vec![
                 descriptor(1),
                 ReplicaDescriptor {
@@ -888,6 +903,9 @@ fn identical_effect_under_a_new_operation_id_is_not_treated_as_unrelated_work() 
     let payload = || OperationPayload::ReseedReplica {
         availability_group: availability_group(),
         database: database(),
+        expected_database_id: 5,
+        expected_database_guid: guid(21),
+        expected_recovery_fork_id: guid(30),
         source: replica(1),
         target: replica(2),
     };
@@ -974,8 +992,109 @@ fn decoded_requests_must_carry_a_supported_contract_version() {
         ),
         Err(ContractError::UnsupportedProfile {
             field: "operation contract version",
-            expected: "1",
+            expected: "2",
             actual: (OPERATION_CONTRACT_VERSION + 1).to_string(),
+        })
+    );
+    assert_eq!(OPERATION_CONTRACT_VERSION, 2);
+    assert_eq!(
+        OperationRequest::from_decoded_parts(1, "", "join-1", "configuration-1", 1, 1, payload(),),
+        Err(ContractError::UnsupportedProfile {
+            field: "operation contract version",
+            expected: "2",
+            actual: "1".to_string(),
+        })
+    );
+}
+
+#[test]
+fn bootstrap_primary_is_an_exact_desired_member_and_changes_the_bound_effect() {
+    let payload = |primary| OperationPayload::EnsureAvailabilityGroup {
+        name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
+        expected_group_id: None,
+        database_name: SqlIdentifier::new("application").unwrap(),
+        primary,
+        replicas: vec![descriptor(1), descriptor(2), descriptor(3)],
+    };
+    for primary in [
+        desired_replica(4),
+        ReplicaIdentity::desired("replica-1", "replacement-pod").unwrap(),
+        replica(1),
+    ] {
+        assert!(
+            OperationRequest::new(
+                "default/example",
+                "bootstrap-1",
+                "configuration-1",
+                0,
+                1,
+                payload(primary),
+            )
+            .is_err()
+        );
+    }
+    let first = request("bootstrap-1", 0, 1, payload(desired_replica(1)));
+    let second = request("bootstrap-1", 0, 1, payload(desired_replica(2)));
+    assert_ne!(first.canonical_input(), second.canonical_input());
+    assert_ne!(first.effect_signature(), second.effect_signature());
+}
+
+#[test]
+fn reseeding_binds_all_old_local_database_identity_fields() {
+    let payload =
+        |expected_database_id, database_guid, recovery_fork| OperationPayload::ReseedReplica {
+            availability_group: availability_group(),
+            database: database(),
+            expected_database_id,
+            expected_database_guid: guid(database_guid),
+            expected_recovery_fork_id: guid(recovery_fork),
+            source: replica(1),
+            target: replica(2),
+        };
+    for database_id in 0..=4 {
+        assert!(
+            OperationRequest::new(
+                "default/example",
+                "reseed-1",
+                "configuration-1",
+                1,
+                1,
+                payload(database_id, 21, 30),
+            )
+            .is_err()
+        );
+    }
+    let original = request("reseed-1", 1, 1, payload(5, 21, 30));
+    for changed_payload in [payload(6, 21, 30), payload(5, 22, 30), payload(5, 21, 31)] {
+        let changed = request("reseed-1", 1, 1, changed_payload);
+        assert_ne!(original.effect_signature(), changed.effect_signature());
+        assert_eq!(
+            OperationEnvelope::new(
+                changed.clone(),
+                Some(approval(&original)),
+                Some(fence(&changed, replica(2))),
+            ),
+            Err(ContractError::ApprovalInputMismatch)
+        );
+        assert_eq!(
+            OperationEnvelope::new(
+                changed.clone(),
+                Some(approval(&changed)),
+                Some(fence(&original, replica(2))),
+            ),
+            Err(ContractError::FenceInputMismatch)
+        );
+    }
+    assert_eq!(
+        FenceReference::new(
+            "runtime",
+            "receipt",
+            original.operation_id(),
+            original.input_signature(),
+            desired_replica(2),
+        ),
+        Err(ContractError::MissingNativeIdentity {
+            field: "fenced replica",
         })
     );
 }
@@ -1002,6 +1121,7 @@ fn supported_profile_constants_agree() {
                 name: AvailabilityGroupName::new("kuberic-ag").unwrap(),
                 expected_group_id: None,
                 database_name: SqlIdentifier::new("application").unwrap(),
+                primary: desired_replica(1),
                 replicas,
             },
         ),

@@ -219,7 +219,7 @@ impl Serialize for DecimalProgress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Endpoint {
     host: String,
     port: u16,
@@ -366,7 +366,7 @@ impl ReplicaIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplicaDescriptor {
     pub identity: ReplicaIdentity,
     pub server_name: ServerName,

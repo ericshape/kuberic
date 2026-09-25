@@ -226,7 +226,7 @@ fn file_error(stage: &'static str, kind: std::io::ErrorKind) -> RuntimeError {
     )
 }
 
-fn validate_path(path: &Path) -> Result<(), RuntimeError> {
+pub(crate) fn validate_path(path: &Path) -> Result<(), RuntimeError> {
     if !path.is_absolute()
         || path
             .to_str()
